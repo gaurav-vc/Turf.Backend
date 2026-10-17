@@ -8,10 +8,20 @@ class RuleSetSerializer(serializers.ModelSerializer):
 
 class SportSerializer(serializers.ModelSerializer):
     rulesets = RuleSetSerializer(many=True, read_only=True)
+    slug = serializers.SlugField(required=False)
+    scoring_engine = serializers.CharField(required=False, default='standard')
     
     class Meta:
         model = Sport
         fields = '__all__'
+
+    def create(self, validated_data):
+        if not validated_data.get('slug'):
+            from django.utils.text import slugify
+            validated_data['slug'] = slugify(validated_data.get('name', 'sport'))
+        if not validated_data.get('scoring_engine'):
+            validated_data['scoring_engine'] = 'standard'
+        return super().create(validated_data)
 
 class PlayerSerializer(serializers.ModelSerializer):
     class Meta:

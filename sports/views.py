@@ -2,8 +2,8 @@ from rest_framework import viewsets, permissions
 from .models import Sport, RuleSet, Team
 from .serializers import SportSerializer, RuleSetSerializer, TeamSerializer
 
-class SportViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = Sport.objects.all()
+class SportViewSet(viewsets.ModelViewSet):
+    queryset = Sport.objects.all().order_by('name')
     serializer_class = SportSerializer
     permission_classes = [permissions.IsAuthenticatedOrReadOnly]
 

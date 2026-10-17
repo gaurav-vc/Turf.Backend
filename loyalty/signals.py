@@ -7,11 +7,15 @@ import decimal
 
 @receiver(post_save, sender=settings.AUTH_USER_MODEL)
 def create_user_wallet(sender, instance, created, **kwargs):
+    if kwargs.get('raw', False):
+        return
     if created:
-        Wallet.objects.create(user=instance, balance=50.00) # Give 50 free TurfCoins on signup!
+        Wallet.objects.get_or_create(user=instance, defaults={'balance': 50.00}) # Give 50 free TurfCoins on signup!
         
 @receiver(post_save, sender=Booking)
 def award_turf_coins(sender, instance, created, **kwargs):
+    if kwargs.get('raw', False):
+        return
     # Only award coins when booking is confirmed
     # In a real app, you might want to track if coins were already awarded for this booking
     if instance.status == 'CONFIRMED' and instance.amount > 0:
