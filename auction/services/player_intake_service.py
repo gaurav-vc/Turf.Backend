@@ -169,8 +169,19 @@ class PlayerIntakeService:
                         status='AVAILABLE'
                     )
 
+                    # Collect standard specialized fields into custom_data
+                    custom_data = {
+                        'tagging': get_val('tagging', 'tag', 'player tagging') or 'Player',
+                        'app_name': get_val('app name', 'app_name'),
+                        'app_id': get_val('app id', 'app_id'),
+                        'experience': get_val('experience', 'exp'),
+                        'nationality': get_val('nationality', 'country') or 'Indian',
+                        'pin_code': get_val('pin code', 'pincode', 'postal code', 'zip'),
+                        'awards_won': get_val('awards won', 'awards', 'achievements'),
+                        'bowling_type': get_val('bowling type', 'bowler type') or bowling,
+                    }
+
                     # Collect custom fields
-                    custom_data = {}
                     for field_def in auction.custom_fields.all():
                         f_val = get_val(field_def.field_key, field_def.label)
                         if f_val:
