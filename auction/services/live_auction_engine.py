@@ -77,9 +77,18 @@ class LiveAuctionEngine:
             'config': {
                 'max_squad': config.max_squad if config else 11,
                 'timer_seconds': config.timer_seconds if config else 30,
+                'closing_wait_seconds': config.closing_wait_seconds if config else 5,
+                'online_timer_enabled': config.online_timer_enabled if config else False,
+                'sold_animation': config.sold_animation if config else True,
                 'sold_animation_style': config.sold_animation_style if config else 'Confetti Burst',
+                'sold_animation_duration': config.sold_animation_duration if config else 3,
+                'highest_bid_animation': config.highest_bid_animation if config else True,
                 'highest_bid_animation_style': config.highest_bid_animation_style if config else 'Fireworks',
+                'highest_bid_animation_duration': config.highest_bid_animation_duration if config else 5,
                 'sound_effects': config.sound_effects if config else True,
+                'completion_message': config.completion_message if config else 'Auction Completed - All teams are now completed',
+                'sold_animation_custom': (design.design_json.get('setup_rules_extended', {}).get('sold_animation_custom', '')) if design and design.design_json else '',
+                'highest_bid_animation_custom': (design.design_json.get('setup_rules_extended', {}).get('highest_bid_animation_custom', '')) if design and design.design_json else '',
             } if config else {},
             'design': design.design_json if design else {},
         }

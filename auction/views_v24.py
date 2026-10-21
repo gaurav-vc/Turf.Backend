@@ -5,6 +5,7 @@ import os
 import uuid
 import csv
 import io
+import re
 from decimal import Decimal
 from django.conf import settings
 from django.http import HttpResponse
@@ -165,12 +166,23 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
     def hammer_sold(self, request, pk=None):
         """HAMMER DOWN: Sells active player to highest bidder."""
         auction = self._get_auction(pk)
+        
+        # Calculate highest sale achieved earlier before this sale
+        prev_highest = auction.players.filter(status='SOLD').order_by('-sold_price').first()
+        prev_highest_amount = prev_highest.sold_price if (prev_highest and prev_highest.sold_price) else Decimal('0.00')
+
         ok, result = LiveAuctionEngine.sell_active_player(auction)
         if not ok:
             return Response({'error': result}, status=status.HTTP_400_BAD_REQUEST)
 
+        sold_player = result
+        celebration = 'sold'
+        if sold_player and getattr(sold_player, 'sold_price', None):
+            if prev_highest_amount > 0 and sold_player.sold_price >= prev_highest_amount:
+                celebration = 'highest_bid'
+
         state = LiveAuctionEngine.get_live_state(auction)
-        return Response({'success': True, 'celebration': 'sold', 'state': state})
+        return Response({'success': True, 'celebration': celebration, 'state': state})
 
     @action(detail=True, methods=['post'])
     def hammer_unsold(self, request, pk=None):
@@ -233,6 +245,78 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
         state = LiveAuctionEngine.get_live_state(auction)
         return Response({'success': True, 'state': state})
 
+    @action(detail=True, methods=['post'], url_path='update_player_outcome')
+    def update_player_outcome(self, request, pk=None):
+        """Host / Organizer manual update of a player's auction status, assigned team, and sold bid amount."""
+        auction = self._get_auction(pk)
+        player_id = request.data.get('player_id')
+        if not player_id:
+            return Response({'error': 'player_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        player = auction.players.filter(id=player_id).first()
+        if not player:
+            return Response({'error': 'Player not found in this tournament.'}, status=status.HTTP_404_NOT_FOUND)
+
+        new_status = request.data.get('status') or player.status
+        if new_status == 'PENDING':
+            new_status = 'AVAILABLE'
+        if new_status not in ['AVAILABLE', 'SOLD', 'UNSOLD', 'BIDDING']:
+            return Response({'error': f"Invalid status {new_status}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        prev_status = player.status
+        prev_sold_to = player.sold_to
+        prev_sold_price = player.sold_price or Decimal('0')
+
+        if new_status == 'SOLD':
+            team_id = request.data.get('sold_to') or request.data.get('team_id')
+            if not team_id:
+                return Response({'error': 'Please select the franchise team the player was sold to.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            team = auction.teams.filter(id=team_id).first()
+            if not team:
+                team = auction.teams.filter(team__name__iexact=str(team_id)).first()
+            if not team:
+                return Response({'error': 'Franchise team not found in this tournament.'}, status=status.HTTP_404_NOT_FOUND)
+
+            try:
+                raw_amt = request.data.get('sold_price')
+                sold_price = Decimal(str(raw_amt).replace(',', '').strip()) if raw_amt is not None else player.base_price
+            except Exception:
+                sold_price = player.base_price
+
+            # If re-assigning, refund old team
+            if prev_status == 'SOLD' and prev_sold_to and prev_sold_to.id != team.id:
+                prev_sold_to.remaining_budget += prev_sold_price
+                prev_sold_to.save(update_fields=['remaining_budget'])
+            elif prev_status == 'SOLD' and prev_sold_to and prev_sold_to.id == team.id:
+                team.remaining_budget += prev_sold_price
+
+            team.remaining_budget = max(Decimal('0'), team.remaining_budget - sold_price)
+            team.save(update_fields=['remaining_budget'])
+
+            player.status = 'SOLD'
+            player.sold_to = team
+            player.sold_price = sold_price
+            player.save(update_fields=['status', 'sold_to', 'sold_price'])
+
+        else:
+            # Reverting back to AVAILABLE, UNSOLD, or BIDDING
+            if prev_status == 'SOLD' and prev_sold_to:
+                prev_sold_to.remaining_budget += prev_sold_price
+                prev_sold_to.save(update_fields=['remaining_budget'])
+
+            player.status = new_status
+            player.sold_to = None
+            player.sold_price = None
+            player.save(update_fields=['status', 'sold_to', 'sold_price'])
+
+        from .serializers import AuctionPlayerSerializer
+        return Response({
+            'success': True,
+            'message': f"Player #{player.serial_no} outcome updated successfully.",
+            'player': AuctionPlayerSerializer(player).data
+        })
+
     @action(detail=True, methods=['post'])
     def reauction(self, request, pk=None):
         """Starts re-auction round for unsold players."""
@@ -246,13 +330,156 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
         state = LiveAuctionEngine.get_live_state(auction)
         return Response({'success': True, 'message': msg, 'state': state})
 
+    def _create_single_player(self, auction, request):
+        """Creates a single player profile, user account, category linking, and photo upload."""
+        data = request.data
+        name = data.get('name') or data.get('player_name')
+        if not name or not str(name).strip():
+            return Response({'error': 'Player name is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        name = str(name).strip()
+
+        mobile = str(data.get('mobile') or '').strip()
+        location = str(data.get('location') or '').strip()
+        role_name = str(data.get('role') or data.get('player_skills') or 'All-Rounder').strip()
+        cat_name = str(data.get('category') or '').strip()
+        batting = str(data.get('batting_style') or '').strip()
+        bowling = str(data.get('bowling_style') or '').strip()
+        tagging = str(data.get('tagging') or 'Player').strip()
+
+        age_val = data.get('age')
+        age = None
+        if age_val is not None and str(age_val).strip().isdigit():
+            age = int(str(age_val).strip())
+
+        # Category resolution
+        cat_obj = None
+        if cat_name:
+            cat_obj = auction.categories.filter(name__iexact=cat_name).first()
+            if not cat_obj:
+                cat_obj = AuctionCategory.objects.create(
+                    auction=auction,
+                    name=cat_name,
+                    base_price=Decimal('1000.00'),
+                    target_count=0
+                )
+
+        # Base price
+        base_raw = data.get('base_price')
+        if base_raw is not None and str(base_raw).strip():
+            try:
+                base_price = Decimal(str(base_raw).replace(',', '').strip())
+            except Exception:
+                base_price = cat_obj.base_price if cat_obj else Decimal('1000.00')
+        elif cat_obj and cat_obj.base_price > 0:
+            base_price = cat_obj.base_price
+        else:
+            base_price = Decimal('1000.00')
+
+        # Serial No
+        serial_raw = data.get('serial_no') or data.get('player_no')
+        if serial_raw is not None and str(serial_raw).strip().isdigit():
+            serial_no = int(str(serial_raw).strip())
+        else:
+            last_p = auction.players.order_by('-serial_no').first()
+            serial_no = ((last_p.serial_no or 0) + 1) if last_p else 1
+
+        # Photo handling
+        photo_url = str(data.get('photo_url') or '').strip()
+        photo_file = request.FILES.get('photo_file') or request.FILES.get('photo')
+        if photo_file:
+            try:
+                ext = os.path.splitext(photo_file.name)[1]
+                safe_name = f"player_{auction.id}_{int(time.time())}_{secrets.token_hex(4)}{ext}"
+                saved_path = default_storage.save(f"auction_players/{safe_name}", photo_file)
+                photo_url = request.build_absolute_uri(settings.MEDIA_URL + saved_path)
+            except Exception as e:
+                print("Player photo upload error:", e)
+
+        # Custom data
+        custom_data = {}
+        raw_custom = data.get('custom_data')
+        if raw_custom:
+            if isinstance(raw_custom, str):
+                try:
+                    custom_data = json.loads(raw_custom)
+                except Exception:
+                    custom_data = {}
+            elif isinstance(raw_custom, dict):
+                custom_data = raw_custom
+
+        for k in ['app_name', 'app_id', 'experience', 'nationality', 'pin_code', 'awards_won', 'bowling_type']:
+            val = data.get(k)
+            if val is not None and str(val).strip():
+                custom_data[k] = str(val).strip()
+        custom_data['tagging'] = tagging
+
+        # Create or find User
+        uname = f"auc_{uuid.uuid4().hex[:8]}"
+        p_email = f"{uname}@turfarena.local"
+        player_user = User.objects.create(
+            username=uname,
+            email=p_email,
+            full_name=name,
+            first_name=name,
+            user_type='PLAYER'
+        )
+
+        auc_player = AuctionPlayer.objects.create(
+            auction=auction,
+            player=player_user,
+            serial_no=serial_no,
+            category=cat_obj.name if cat_obj else (cat_name or 'General'),
+            role=role_name,
+            batting_style=batting,
+            bowling_style=bowling,
+            location=location,
+            mobile=mobile,
+            age=age,
+            base_price=base_price,
+            photo_url=photo_url,
+            registration_source='Manual Entry',
+            status='AVAILABLE',
+            custom_data=custom_data
+        )
+
+        return Response({
+            'success': True,
+            'message': 'Player created successfully.',
+            'player': {
+                'id': str(auc_player.id),
+                'serial_no': auc_player.serial_no,
+                'name': name,
+                'player_name': name,
+                'category': auc_player.category,
+                'role': auc_player.role,
+                'base_price': float(auc_player.base_price),
+                'photo_url': auc_player.photo_url,
+                'status': auc_player.status,
+                'mobile': auc_player.mobile,
+                'location': auc_player.location,
+                'age': auc_player.age,
+            }
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['get', 'post'], parser_classes=[MultiPartParser, FormParser, JSONParser], url_path='players')
+    def players(self, request, pk=None):
+        """List players in this tournament or create a single player manually."""
+        auction = self._get_auction(pk)
+        if request.method == 'GET':
+            from .serializers import AuctionPlayerSerializer
+            players_qs = auction.players.select_related('player', 'sold_to', 'sold_to__team').all().order_by('serial_no', 'id')
+            return Response(AuctionPlayerSerializer(players_qs, many=True).data)
+        return self._create_single_player(auction, request)
+
     @action(detail=True, methods=['post'], parser_classes=[MultiPartParser, FormParser])
     def bulk_import_players(self, request, pk=None):
-        """Imports players from an uploaded CSV or Excel file."""
+        """Imports players from an uploaded CSV or Excel file or single manual player entry."""
         auction = self._get_auction(pk)
 
         file_obj = request.FILES.get('file')
         if not file_obj:
+            if request.data.get('name') or request.data.get('player_name'):
+                return self._create_single_player(auction, request)
             return Response({'error': 'No file provided'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
@@ -286,6 +513,9 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                         logo_val = str(t.logo)
                 if not logo_val:
                     logo_val = at.custom_data.get('logo_url', '')
+
+                if logo_val and not (logo_val.startswith('http://') or logo_val.startswith('https://')):
+                    logo_val = request.build_absolute_uri(logo_val)
 
                 data.append({
                     'id': str(at.id),
@@ -528,6 +758,9 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
         if not logo_val:
             logo_val = custom.get('logo_url', '')
 
+        if logo_val and not (logo_val.startswith('http://') or logo_val.startswith('https://')):
+            logo_val = request.build_absolute_uri(logo_val)
+
         return Response({
             'success': True,
             'team': {
@@ -554,7 +787,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             }
         })
 
-    @action(detail=True, methods=['get'])
+    @action(detail=True, methods=['get'], permission_classes=[permissions.AllowAny])
     def teams_template(self, request, pk=None):
         """Generates downloadable CSV template for teams bulk import."""
         buffer = io.StringIO()
@@ -704,7 +937,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-    @action(detail=True, methods=['get'])
+    @action(detail=True, methods=['get'], permission_classes=[permissions.AllowAny])
     def players_template(self, request, pk=None):
         """Generates downloadable CSV template for players bulk import."""
         auction = self._get_auction(pk)
@@ -2183,18 +2416,398 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
         except Exception as exc:
             return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
+    @action(detail=True, methods=['get', 'post'], parser_classes=[MultiPartParser, FormParser, JSONParser], url_path='setup_rules')
+    def setup_rules(self, request, pk=None):
+        auction = self._get_auction(pk)
+        config, _ = AuctionTournamentConfig.objects.get_or_create(auction=auction)
+        design, _ = AuctionPageDesign.objects.get_or_create(
+            auction=auction,
+            defaults={'design_json': DEFAULT_AUCTION_DESIGN}
+        )
+        design_json = design.design_json or {}
+        extended = design_json.setdefault('setup_rules_extended', {})
+
+        if request.method == 'POST':
+            data = request.data
+
+            # 1. Auction Completion
+            completion_msg = data.get('auction_completion_message') or data.get('completion_message')
+            if completion_msg is not None:
+                config.completion_message = str(completion_msg).strip() or 'Auction Completed - All team are now completed'
+
+            # 2. Auction Type & Selection Mode
+            auction_mode = data.get('auction_mode')
+            if auction_mode in ['Centralized', 'Online']:
+                extended['auction_mode'] = auction_mode
+
+            player_sel_mode = data.get('player_selection_mode')
+            if player_sel_mode:
+                config.category_wise_bidding = (player_sel_mode == 'Category Wise')
+            elif 'category_wise_bidding' in data:
+                config.category_wise_bidding = str(data.get('category_wise_bidding')).lower() in ['true', '1']
+
+            # 3. Squad Rules & Budget
+            max_squad = data.get('max_squad')
+            if max_squad is not None:
+                try:
+                    val = int(max_squad)
+                    config.max_squad = val
+                    config.min_players = val
+                    config.max_players = val
+                except ValueError:
+                    pass
+
+            team_purse = data.get('team_purse')
+            if team_purse is not None:
+                try:
+                    auction.base_budget = Decimal(str(team_purse))
+                    auction.save(update_fields=['base_budget'])
+                except Exception:
+                    pass
+
+            for legacy_f in ['reserve_amount', 'additional_kitty', 'penalty_amount']:
+                if legacy_f in data:
+                    try:
+                        setattr(config, legacy_f, Decimal(str(data[legacy_f])))
+                    except Exception:
+                        pass
+
+            if 'retention_allowed' in data:
+                extended['retention_allowed'] = str(data.get('retention_allowed')).lower() in ['true', '1', 'on']
+            if 'bring_back_unsold' in data:
+                config.bring_back_unsold = str(data.get('bring_back_unsold')).lower() in ['true', '1', 'on']
+            if 'confirm_sale' in data:
+                config.confirm_sale = str(data.get('confirm_sale')).lower() in ['true', '1', 'on']
+
+            # 4. SOLD Celebration Animations
+            if 'sold_animation' in data:
+                config.sold_animation = str(data.get('sold_animation')).lower() in ['true', '1', 'on']
+            if 'highest_bid_animation' in data:
+                config.highest_bid_animation = str(data.get('highest_bid_animation')).lower() in ['true', '1', 'on']
+
+            sold_style = data.get('sold_animation_style')
+            if sold_style:
+                config.sold_animation_style = sold_style
+            if 'sold_animation_duration' in data:
+                try:
+                    config.sold_animation_duration = int(data['sold_animation_duration'])
+                except ValueError:
+                    pass
+
+            highest_style = data.get('highest_bid_animation_style')
+            if highest_style:
+                config.highest_bid_animation_style = highest_style
+            if 'highest_bid_animation_duration' in data:
+                try:
+                    config.highest_bid_animation_duration = int(data['highest_bid_animation_duration'])
+                except ValueError:
+                    pass
+
+            # 5. Timer & Sound
+            if 'online_timer_enabled' in data:
+                config.online_timer_enabled = str(data.get('online_timer_enabled')).lower() in ['true', '1', 'on']
+            if 'timer_seconds' in data:
+                try:
+                    config.timer_seconds = int(data['timer_seconds'])
+                except ValueError:
+                    pass
+            if 'closing_wait_seconds' in data:
+                try:
+                    config.closing_wait_seconds = int(data['closing_wait_seconds'])
+                except ValueError:
+                    pass
+            if 'sound_effects' in data:
+                config.sound_effects = str(data.get('sound_effects')).lower() in ['true', '1', 'on']
+
+            # 6. Category Source & Sequence
+            cat_source = data.get('category_source')
+            if cat_source in ['Setup', 'Player Master']:
+                extended['category_source'] = cat_source
+
+            raw_seq = data.get('category_sequence') or data.get('auction_category_sequence')
+            if raw_seq is not None:
+                if isinstance(raw_seq, str):
+                    config.category_sequence = [x.strip() for x in raw_seq.split(',') if x.strip()]
+                elif isinstance(raw_seq, list):
+                    config.category_sequence = [str(x).strip() for x in raw_seq if str(x).strip()]
+
+            # 7. Categories sync/update
+            raw_cats = data.get('categories')
+            if isinstance(raw_cats, str):
+                try:
+                    raw_cats = json.loads(raw_cats)
+                except Exception:
+                    raw_cats = None
+
+            if isinstance(raw_cats, list):
+                incoming_names = []
+                for idx, c_item in enumerate(raw_cats, 1):
+                    name = str(c_item.get('name', '')).strip()
+                    if not name:
+                        continue
+                    incoming_names.append(name.lower())
+                    base = Decimal(str(c_item.get('base_price', 0) or 0))
+                    target = int(c_item.get('target_count', 0) or 0)
+                    cat_obj = auction.categories.filter(name__iexact=name).first()
+                    if cat_obj:
+                        cat_obj.name = name
+                        cat_obj.base_price = base
+                        cat_obj.min_bid = base
+                        cat_obj.target_count = target
+                        cat_obj.display_order = idx
+                        cat_obj.save()
+                    else:
+                        AuctionCategory.objects.create(
+                            auction=auction,
+                            name=name,
+                            base_price=base,
+                            min_bid=base,
+                            target_count=target,
+                            display_order=idx
+                        )
+                for existing_cat in auction.categories.all():
+                    if existing_cat.name.strip().lower() not in incoming_names:
+                        existing_cat.delete()
+            elif data.get('category_names'):
+                names = [x.strip() for x in data.get('category_names', '').split(',') if x.strip()]
+                if names:
+                    incoming_names = [n.lower() for n in names]
+                    for idx, n in enumerate(names, 1):
+                        base = Decimal(str(data.get(f'cat_base_{idx}', 0) or 0))
+                        target = int(data.get(f'cat_target_{idx}', 0) or 0)
+                        cat_obj = auction.categories.filter(name__iexact=n).first()
+                        if cat_obj:
+                            cat_obj.name = n
+                            cat_obj.base_price = base
+                            cat_obj.min_bid = base
+                            cat_obj.target_count = target
+                            cat_obj.display_order = idx
+                            cat_obj.save()
+                        else:
+                            AuctionCategory.objects.create(
+                                auction=auction,
+                                name=n,
+                                base_price=base,
+                                min_bid=base,
+                                target_count=target,
+                                display_order=idx
+                            )
+                    for existing_cat in auction.categories.all():
+                        if existing_cat.name.strip().lower() not in incoming_names:
+                            existing_cat.delete()
+
+            # 8. Slabs sync/update
+            raw_slabs = data.get('slabs')
+            if isinstance(raw_slabs, str):
+                try:
+                    raw_slabs = json.loads(raw_slabs)
+                except Exception:
+                    raw_slabs = None
+
+            if isinstance(raw_slabs, list):
+                auction.bid_slabs.all().delete()
+                slabs_to_create = []
+                for idx, s_item in enumerate(raw_slabs, 1):
+                    up_to = Decimal(str(s_item.get('up_to_bid', 0) or 0))
+                    inc = Decimal(str(s_item.get('increment', 0) or 0))
+                    if up_to > 0 and inc > 0:
+                        slabs_to_create.append(BidSlab(
+                            auction=auction,
+                            up_to_bid=up_to,
+                            increment=inc,
+                            display_order=idx
+                        ))
+                if slabs_to_create:
+                    BidSlab.objects.bulk_create(slabs_to_create)
+
+            # 9. Groups
+            raw_groups = data.get('groups')
+            if isinstance(raw_groups, str):
+                try:
+                    raw_groups = json.loads(raw_groups)
+                except Exception:
+                    raw_groups = None
+
+            if isinstance(raw_groups, list):
+                extended['groups'] = [
+                    {'name': str(g.get('name', f"Group {i+1}")).strip(), 'team_count': int(g.get('team_count', 1))}
+                    for i, g in enumerate(raw_groups)
+                ]
+
+            group_card_col = data.get('group_card_colour')
+            if group_card_col:
+                extended['group_card_colour'] = group_card_col
+
+            # 10. File Uploads (Branding & Custom Animations)
+            if 'tournament_logo' in request.FILES:
+                t_file = request.FILES['tournament_logo']
+                remove_bg = str(data.get('remove_tournament_logo_bg', '')).lower() in ['true', '1', 'on']
+                try:
+                    res = AssetManagerService.save_and_process_asset(
+                        str(auction.id), t_file, 'Tournament Logo', 'Logo', remove_bg
+                    )
+                    logo_url = res.get('processed_url') or res.get('original_url')
+                    config.tournament_logo = logo_url
+                    if 'zones' not in design_json:
+                        design_json['zones'] = {}
+                    if 'branding' not in design_json['zones']:
+                        design_json['zones']['branding'] = {}
+                    design_json['zones']['branding']['title_image_url'] = logo_url
+                    design_json['zones']['branding']['remove_title_bg'] = remove_bg
+                except Exception as e:
+                    print("Logo upload error:", e)
+
+            if 'auction_background_file' in request.FILES:
+                bg_file = request.FILES['auction_background_file']
+                try:
+                    ext = os.path.splitext(bg_file.name)[1]
+                    safe_name = f"auction_bg_{auction.id}_{int(time.time())}{ext}"
+                    saved_path = default_storage.save(f"auction/branding/{safe_name}", bg_file)
+                    config.auction_background = request.build_absolute_uri(settings.MEDIA_URL + saved_path)
+                except Exception as e:
+                    print("Auction background file upload error:", e)
+            elif data.get('auction_background'):
+                config.auction_background = str(data.get('auction_background')).strip()
+
+            if 'overall_background_file' in request.FILES:
+                obg_file = request.FILES['overall_background_file']
+                try:
+                    ext = os.path.splitext(obg_file.name)[1]
+                    safe_name = f"overall_bg_{auction.id}_{int(time.time())}{ext}"
+                    saved_path = default_storage.save(f"auction/branding/{safe_name}", obg_file)
+                    config.overall_background = request.build_absolute_uri(settings.MEDIA_URL + saved_path)
+                except Exception as e:
+                    print("Overall background file upload error:", e)
+            elif data.get('overall_background'):
+                config.overall_background = str(data.get('overall_background')).strip()
+
+            if 'sold_animation_custom' in request.FILES:
+                anim_file = request.FILES['sold_animation_custom']
+                try:
+                    ext = os.path.splitext(anim_file.name)[1]
+                    safe_name = f"sold_anim_{auction.id}_{int(time.time())}{ext}"
+                    saved_path = default_storage.save(f"auction/animations/{safe_name}", anim_file)
+                    extended['sold_animation_custom'] = request.build_absolute_uri(settings.MEDIA_URL + saved_path)
+                except Exception as e:
+                    print("Sold animation upload error:", e)
+            elif 'sold_animation_custom_url' in data:
+                extended['sold_animation_custom'] = str(data.get('sold_animation_custom_url', '')).strip()
+
+            if 'highest_bid_animation_custom' in request.FILES:
+                anim_file = request.FILES['highest_bid_animation_custom']
+                try:
+                    ext = os.path.splitext(anim_file.name)[1]
+                    safe_name = f"highest_anim_{auction.id}_{int(time.time())}{ext}"
+                    saved_path = default_storage.save(f"auction/animations/{safe_name}", anim_file)
+                    extended['highest_bid_animation_custom'] = request.build_absolute_uri(settings.MEDIA_URL + saved_path)
+                except Exception as e:
+                    print("Highest bid animation upload error:", e)
+            elif 'highest_bid_animation_custom_url' in data:
+                extended['highest_bid_animation_custom'] = str(data.get('highest_bid_animation_custom_url', '')).strip()
+
+            config.save()
+            design_json['setup_rules_extended'] = extended
+            design.design_json = design_json
+            design.save(update_fields=['design_json'])
+
+        # GET response construction
+        player_cats = list(
+            auction.players.exclude(category__isnull=True)
+            .exclude(category__exact='')
+            .values_list('category', flat=True)
+            .distinct()
+        )
+
+        categories = list(auction.categories.all().order_by('display_order', 'created_at').values(
+            'id', 'name', 'base_price', 'target_count', 'display_order'
+        ))
+
+        slabs = list(auction.bid_slabs.all().order_by('up_to_bid').values(
+            'id', 'up_to_bid', 'increment', 'display_order'
+        ))
+
+        squad_rules = list(auction.squad_rules.all().order_by('display_order', 'created_at').values(
+            'id', 'field_key', 'operator', 'field_value', 'min_count', 'max_count', 'active', 'display_order'
+        ))
+
+        active_teams_count = auction.teams.count()
+
+        groups = extended.get('groups')
+        if not groups:
+            existing_cards = list(auction.group_cards.values_list('group_name', flat=True).distinct())
+            if existing_cards:
+                groups = [{'name': name, 'team_count': auction.group_cards.filter(group_name=name).count()} for name in existing_cards]
+            else:
+                groups = [
+                    {'name': 'Group 1', 'team_count': max(1, active_teams_count // 2)},
+                    {'name': 'Group 2', 'team_count': max(1, active_teams_count - (active_teams_count // 2))}
+                ]
+
+        seq = config.category_sequence
+        if not seq:
+            seq = [c['name'] for c in categories]
+
+        return Response({
+            'success': True,
+            'auction': {
+                'id': str(auction.id),
+                'name': auction.name,
+                'team_purse': float(auction.base_budget),
+                'active_teams_count': active_teams_count,
+            },
+            'config': {
+                'auction_completion_message': config.completion_message or 'Auction Completed - All team are now completed',
+                'auction_mode': extended.get('auction_mode', 'Centralized'),
+                'player_selection_mode': 'Category Wise' if config.category_wise_bidding else 'Open',
+                'category_wise_bidding': config.category_wise_bidding,
+                'max_squad': config.max_squad,
+                'team_purse': float(auction.base_budget),
+                'reserve_amount': float(config.reserve_amount),
+                'additional_kitty': float(config.additional_kitty),
+                'penalty_amount': float(config.penalty_amount),
+                'retention_allowed': extended.get('retention_allowed', False),
+                'bring_back_unsold': config.bring_back_unsold,
+                'confirm_sale': config.confirm_sale,
+                'sold_animation': config.sold_animation,
+                'sold_animation_style': config.sold_animation_style or 'Confetti Burst',
+                'sold_animation_duration': config.sold_animation_duration or 3,
+                'highest_bid_animation': config.highest_bid_animation,
+                'highest_bid_animation_style': config.highest_bid_animation_style or 'Fireworks',
+                'highest_bid_animation_duration': config.highest_bid_animation_duration or 5,
+                'sold_animation_custom': extended.get('sold_animation_custom', ''),
+                'highest_bid_animation_custom': extended.get('highest_bid_animation_custom', ''),
+                'category_source': extended.get('category_source', 'Setup'),
+                'category_sequence': seq,
+                'group_count': len(groups),
+                'groups': groups,
+                'group_card_colour': extended.get('group_card_colour', '#FFFFFF'),
+                'tournament_logo': config.tournament_logo or '',
+                'auction_background': config.auction_background or 'stadium',
+                'overall_background': config.overall_background or 'default',
+                'online_timer_enabled': config.online_timer_enabled,
+                'timer_seconds': config.timer_seconds or 30,
+                'closing_wait_seconds': config.closing_wait_seconds or 5,
+                'sound_effects': config.sound_effects,
+            },
+            'categories': categories,
+            'slabs': slabs,
+            'squad_rules': squad_rules,
+            'player_master_categories': player_cats,
+            'animation_styles': ['Confetti Burst', 'Fireworks', 'Gold Celebration', 'Spotlight', 'Trophy Celebration'],
+        })
+
 # Dedicated CRUD ViewSets for Setup & Custom Fields
 class AuctionCategoryViewSet(viewsets.ModelViewSet):
     queryset = AuctionCategory.objects.all()
     serializer_class = AuctionCategorySerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.AllowAny]
 
     def get_queryset(self):
         qs = super().get_queryset()
         auction_id = self.request.query_params.get('auction')
         if auction_id:
             qs = qs.filter(auction_id=auction_id)
-        return qs
+        return qs.order_by('display_order', 'id')
 
 class BidSlabViewSet(viewsets.ModelViewSet):
     queryset = BidSlab.objects.all()

@@ -187,6 +187,40 @@ class AuctionPlayerViewSet(viewsets.ModelViewSet):
             qs = qs.filter(auction_id=auction_id)
         return qs
 
+    def partial_update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        data = request.data
+        name = data.get('name') or data.get('player_name')
+        if name and instance.player:
+            instance.player.full_name = str(name).strip()
+            instance.player.first_name = str(name).strip()
+            instance.player.save(update_fields=['full_name', 'first_name'])
+
+        if 'photo_file' in request.FILES:
+            from django.core.files.storage import default_storage
+            from django.conf import settings
+            import os, time, secrets
+            p_file = request.FILES['photo_file']
+            ext = os.path.splitext(p_file.name)[1]
+            safe_name = f"player_{instance.id}_{int(time.time())}_{secrets.token_hex(4)}{ext}"
+            saved_path = default_storage.save(f"auction_players/{safe_name}", p_file)
+            instance.photo_url = request.build_absolute_uri(settings.MEDIA_URL + saved_path)
+            instance.save(update_fields=['photo_url'])
+
+        if 'custom_data' in data:
+            raw_cd = data['custom_data']
+            if isinstance(raw_cd, str):
+                import json
+                try:
+                    instance.custom_data = json.loads(raw_cd)
+                except Exception:
+                    pass
+            elif isinstance(raw_cd, dict):
+                instance.custom_data = raw_cd
+            instance.save(update_fields=['custom_data'])
+
+        return super().partial_update(request, *args, **kwargs)
+
 
 class BidViewSet(viewsets.ModelViewSet):
     queryset = Bid.objects.all()
