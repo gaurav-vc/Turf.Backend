@@ -101,11 +101,24 @@ DEFAULT_AUCTION_DESIGN = {
     }
 }
 
+from rest_framework.negotiation import DefaultContentNegotiation
+
+class SafeContentNegotiation(DefaultContentNegotiation):
+    def select_renderer(self, request, renderers, format_suffix=None):
+        format_param = request.query_params.get(self.settings.FORMAT_SUFFIX_KWARG)
+        if format_param and str(format_param).lower() in ['category', 'auction', 'all', 'pdf', 'csv', 'custom']:
+            format_suffix = None
+        try:
+            return super().select_renderer(request, renderers, format_suffix)
+        except Exception:
+            return renderers[0], renderers[0].media_type
+
 class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
     """
     Dedicated ViewSet for Phase 2 V24 Live Auction Console Operations.
     """
     permission_classes = [permissions.IsAuthenticated]
+    content_negotiation_class = SafeContentNegotiation
 
     def _get_auction(self, pk):
         auction = None
@@ -1301,7 +1314,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             },
         })
 
-    @action(detail=True, methods=['get'], permission_classes=[permissions.AllowAny])
+    @action(detail=True, methods=['get', 'post'], permission_classes=[permissions.AllowAny])
     def export_cards_pdf(self, request, pk=None):
         """Generates a downloadable printable PDF of player auction cards based on grid settings."""
         auction = self._get_auction(pk)
@@ -1312,14 +1325,28 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
         except (ValueError, TypeError):
             cols, rows = 3, 5
 
-        pdf_format = request.query_params.get('format', 'category')
+        pdf_format = (
+            request.query_params.get('pdf_format') or
+            request.query_params.get('export_format') or
+            request.query_params.get('format') or
+            (request.data.get('pdf_format') if isinstance(request.data, dict) else None) or
+            (request.data.get('format') if isinstance(request.data, dict) else None) or
+            'category'
+        )
 
-        # Load saved PDF design settings if available
-        design_obj = getattr(auction, 'page_design', None)
+        # Load saved PDF design settings if available safely without raising ObjectDoesNotExist
+        design_obj = AuctionPageDesign.objects.filter(auction=auction).first() if auction else None
         pdf_settings = (design_obj.design_json or {}).get('pdf_design', {}) if design_obj else {}
-        cfg_elements = pdf_settings.get('elements', {})
-        card_fill_hex = pdf_settings.get('card_fill', '#FFFFFF')
-        accent_hex = pdf_settings.get('accent_colour', '#2563EB')
+        if not pdf_settings and design_obj and isinstance(design_obj.design_json, dict):
+            if 'branding' in design_obj.design_json or 'elements' in design_obj.design_json:
+                pdf_settings = design_obj.design_json
+        
+        # Check if direct pdf_design was passed in POST body
+        if request.method == 'POST' and isinstance(request.data, dict):
+            if 'pdf_design' in request.data and isinstance(request.data['pdf_design'], dict):
+                pdf_settings = request.data['pdf_design']
+            elif 'branding' in request.data or 'elements' in request.data:
+                pdf_settings = request.data
 
         players = list(auction.players.all().order_by('serial_no')) if auction else []
         if not players:
@@ -1350,237 +1377,94 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 MockP(8, 'Rinku Singh', 'Finisher Batsman', 'Tier 2 Emerging', 2000),
             ]
 
-        # 1. Try ReportLab if installed
+        from django.http import HttpResponse
+        pdf_bytes = self._generate_pure_cards_pdf(
+            auction_name=auction_name,
+            players=players,
+            cols=cols,
+            rows=rows,
+            pdf_format=pdf_format,
+            pdf_settings=pdf_settings
+        )
+        response = HttpResponse(pdf_bytes, content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="{auction_name}_Player_Cards.pdf"'
+        return response
+
+    def _process_image_to_jpeg_dict(self, img_data_or_url, opacity=1.0):
+        if not img_data_or_url:
+            return None
         try:
             import io
-            from collections import defaultdict
-            from reportlab.lib import colors
-            from reportlab.lib.pagesizes import A4
-            from reportlab.lib.units import mm
-            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
-            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-            from django.http import HttpResponse
+            import os
+            import base64
+            from PIL import Image
+            from django.conf import settings
 
-            out = io.BytesIO()
-            page_w, page_h = A4
-            margin = 8 * mm
-            doc = SimpleDocTemplate(
-                out,
-                pagesize=A4,
-                leftMargin=margin,
-                rightMargin=margin,
-                topMargin=margin,
-                bottomMargin=margin,
-                title=f"{auction_name} - Player Cards"
-            )
+            raw_bytes = None
+            s = str(img_data_or_url).strip()
 
-            styles = getSampleStyleSheet()
-            p_cat_header = ParagraphStyle('CatHeader', fontName='Helvetica-Bold', fontSize=12, leading=14, textColor=colors.HexColor('#1E293B'))
-            p_name_style = ParagraphStyle('CardName', fontName='Helvetica-Bold', fontSize=9.5, leading=11, textColor=colors.HexColor('#0F172A'))
-            p_sub_style = ParagraphStyle('CardSub', fontName='Helvetica', fontSize=7, leading=8.5, textColor=colors.HexColor('#475569'))
-            p_badge_style = ParagraphStyle('CardBadge', fontName='Helvetica-Bold', fontSize=7, leading=8, textColor=colors.HexColor(accent_hex))
-            p_price_style = ParagraphStyle('CardPrice', fontName='Helvetica-Bold', fontSize=8, leading=9.5, textColor=colors.HexColor('#16A34A'))
+            if s.startswith('data:'):
+                if ',' in s:
+                    _, b64_part = s.split(',', 1)
+                    raw_bytes = base64.b64decode(b64_part)
+            elif s.startswith('http://') or s.startswith('https://'):
+                import urllib.request
+                req = urllib.request.urlopen(s, timeout=6)
+                raw_bytes = req.read()
+            elif s.startswith('/media/') or s.startswith('media/'):
+                rel_path = s.lstrip('/').replace('media/', '', 1)
+                full_path = os.path.join(settings.MEDIA_ROOT, rel_path)
+                if os.path.exists(full_path):
+                    with open(full_path, 'rb') as f:
+                        raw_bytes = f.read()
+            elif os.path.exists(s):
+                with open(s, 'rb') as f:
+                    raw_bytes = f.read()
 
-            usable_w = page_w - (2 * margin)
-            usable_h = page_h - (2 * margin) - 8 * mm  # Account for header
-            card_w = usable_w / cols
-            card_h = usable_h / rows
+            if not raw_bytes:
+                return None
 
-            def is_elem_selected(k, default=True):
-                if k in cfg_elements:
-                    return cfg_elements[k].get('selected', default)
-                return default
+            im = Image.open(io.BytesIO(raw_bytes))
+            # Downscale if excessively large to keep PDF rendering fast & lightweight
+            max_dim = 1600
+            if im.width > max_dim or im.height > max_dim:
+                im.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
 
-            def has_label(k, default=False):
-                if k in cfg_elements:
-                    return cfg_elements[k].get('show_label', default)
-                return default
+            orig_w, orig_h = im.size
+            opacity = max(0.01, min(1.0, float(opacity)))
 
-            def render_card_cell(p):
-                if not p:
-                    empty_tbl = Table([[Paragraph('', p_name_style)]], colWidths=[card_w - 3*mm], rowHeights=[card_h - 3*mm])
-                    empty_tbl.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), colors.transparent)]))
-                    return empty_tbl
-
-                name = getattr(p, 'name', None) or (p.player.full_name if getattr(p, 'player', None) else 'Player')
-                serial = getattr(p, 'serial_no', '—')
-                role = getattr(p, 'role', 'Player') or 'Player'
-                cat = getattr(p, 'tier', None) or getattr(p, 'category', None) or 'General'
-                price = getattr(p, 'base_price', 2000) or 2000
-                loc = getattr(p, 'location', '') or ''
-                bat = getattr(p, 'batting_style', '') or ''
-                bowl = getattr(p, 'bowling_style', '') or ''
-                mob = getattr(p, 'mobile', '') or ''
-                age = getattr(p, 'age', '') or ''
-                cdata = getattr(p, 'custom_data', {}) or {}
-                exp = getattr(p, 'experience', '') or cdata.get('experience') or ''
-                app_id = cdata.get('application_id') or str(getattr(p, 'id', ''))[:8]
-
-                content = []
-                # 1. Serial No & Category
-                top_line = []
-                if is_elem_selected('player_number', True):
-                    lbl = 'Player #' if has_label('player_number', False) else '#'
-                    top_line.append(f"<b>{lbl}{serial}</b>")
-                if is_elem_selected('category', True):
-                    lbl = 'Cat: ' if has_label('category', False) else ''
-                    top_line.append(f"<font color='{accent_hex}'><b>[{lbl}{cat}]</b></font>")
-                if top_line:
-                    content.append(Paragraph("&nbsp;&nbsp;".join(top_line), p_badge_style))
-
-                # 2. Player Name
-                if is_elem_selected('name', True):
-                    lbl = 'Name: ' if has_label('name', False) else ''
-                    content.append(Paragraph(f"<b>{lbl}{name}</b>", p_name_style))
-
-                # 3. Role
-                if is_elem_selected('role', True):
-                    lbl = 'Role: ' if has_label('role', False) else ''
-                    content.append(Paragraph(f"{lbl}{role}", p_sub_style))
-
-                # 4. Base Price
-                if is_elem_selected('base_price', True):
-                    lbl = 'Base Price: ' if has_label('base_price', True) else 'Base: '
-                    content.append(Paragraph(f"{lbl}₹{int(price):,}", p_price_style))
-
-                # 5. Batting & Bowling
-                specs = []
-                if is_elem_selected('batting', True) and bat:
-                    lbl = 'Bat: ' if has_label('batting', True) else ''
-                    specs.append(f"{lbl}{bat}")
-                if is_elem_selected('bowling', True) and bowl:
-                    lbl = 'Bowl: ' if has_label('bowling', True) else ''
-                    specs.append(f"{lbl}{bowl}")
-                if specs:
-                    content.append(Paragraph(" • ".join(specs), p_sub_style))
-
-                # 6. Location, Age, Mobile
-                extra = []
-                if is_elem_selected('location', True) and loc:
-                    lbl = 'Loc: ' if has_label('location', True) else ''
-                    extra.append(f"{lbl}{loc}")
-                if is_elem_selected('age', True) and age:
-                    lbl = 'Age: ' if has_label('age', True) else ''
-                    extra.append(f"{lbl}{age}")
-                if is_elem_selected('mobile', True) and mob:
-                    lbl = 'Mob: ' if has_label('mobile', True) else ''
-                    extra.append(f"{lbl}{mob}")
-                if extra:
-                    content.append(Paragraph(" • ".join(extra), p_sub_style))
-
-                # 7. Experience & Application ID
-                footer = []
-                if is_elem_selected('experience', True) and exp:
-                    lbl = 'Exp: ' if has_label('experience', True) else ''
-                    footer.append(f"{lbl}{exp}")
-                if is_elem_selected('application_id', True) and app_id:
-                    lbl = 'App ID: ' if has_label('application_id', True) else ''
-                    footer.append(f"{lbl}{app_id}")
-                if footer:
-                    content.append(Paragraph(" • ".join(footer), p_sub_style))
-
-                cell_tbl = Table([[c] for c in content], colWidths=[card_w - 4*mm])
-                cell_tbl.setStyle(TableStyle([
-                    ('BACKGROUND', (0,0), (-1,-1), colors.HexColor(card_fill_hex)),
-                    ('BOX', (0,0), (-1,-1), 1, colors.HexColor(accent_hex)),
-                    ('PADDING', (0,0), (-1,-1), 2.5*mm),
-                    ('ALIGN', (0,0), (-1,-1), 'LEFT'),
-                    ('VALIGN', (0,0), (-1,-1), 'TOP'),
-                ]))
-                return cell_tbl
-
-            story = []
-            page_capacity = cols * rows
-
-            if pdf_format == 'category':
-                # Group players by category: "Every category starts on a new page"
-                cat_groups = defaultdict(list)
-                for p in players:
-                    cat_name = getattr(p, 'tier', None) or getattr(p, 'category', None) or 'General Category'
-                    cat_groups[cat_name].append(p)
-
-                cat_keys = list(cat_groups.keys())
-                for c_idx, cat_name in enumerate(cat_keys):
-                    c_players = cat_groups[cat_name]
-                    for page_start in range(0, len(c_players), page_capacity):
-                        # Category Header banner on top of each category page
-                        story.append(Paragraph(
-                            f"<b>{auction_name}</b> &nbsp;|&nbsp; <font color='{accent_hex}'><b>Category: {cat_name}</b></font> ({len(c_players)} Players)",
-                            p_cat_header
-                        ))
-                        story.append(Spacer(1, 3*mm))
-
-                        page_slice = c_players[page_start:page_start + page_capacity]
-                        grid_data = []
-                        for r in range(rows):
-                            row_cells = []
-                            for c in range(cols):
-                                idx = (r * cols) + c
-                                p = page_slice[idx] if idx < len(page_slice) else None
-                                row_cells.append(render_card_cell(p))
-                            grid_data.append(row_cells)
-
-                        page_tbl = Table(grid_data, colWidths=[card_w]*cols, rowHeights=[card_h]*rows)
-                        page_tbl.setStyle(TableStyle([
-                            ('VALIGN', (0,0), (-1,-1), 'TOP'),
-                            ('PADDING', (0,0), (-1,-1), 1),
-                        ]))
-                        story.append(page_tbl)
-
-                        # If more players in this category or next category exists, PageBreak
-                        is_last_cat_page = (page_start + page_capacity >= len(c_players))
-                        is_very_last_page = (c_idx == len(cat_keys) - 1 and is_last_cat_page)
-                        if not is_very_last_page:
-                            story.append(PageBreak())
+            if opacity < 0.999 or im.mode in ('RGBA', 'LA', 'P'):
+                im = im.convert('RGBA')
+                if opacity < 0.999:
+                    r, g, b, a = im.split()
+                    a = a.point(lambda p: int(p * opacity))
+                    im.putalpha(a)
+                # Composite onto clean white canvas for standard PDF RGB JPEG
+                white_canvas = Image.new('RGBA', im.size, (255, 255, 255, 255))
+                final_im = Image.alpha_composite(white_canvas, im).convert('RGB')
             else:
-                # Auction Format (continuous sequential order)
-                story.append(Paragraph(f"<b>{auction_name}</b> &nbsp;|&nbsp; <b>Auction Format Order</b>", p_cat_header))
-                story.append(Spacer(1, 3*mm))
-                for page_start in range(0, len(players), page_capacity):
-                    page_slice = players[page_start:page_start + page_capacity]
-                    grid_data = []
-                    for r in range(rows):
-                        row_cells = []
-                        for c in range(cols):
-                            idx = (r * cols) + c
-                            p = page_slice[idx] if idx < len(page_slice) else None
-                            row_cells.append(render_card_cell(p))
-                        grid_data.append(row_cells)
+                final_im = im.convert('RGB')
 
-                    page_tbl = Table(grid_data, colWidths=[card_w]*cols, rowHeights=[card_h]*rows)
-                    page_tbl.setStyle(TableStyle([
-                        ('VALIGN', (0,0), (-1,-1), 'TOP'),
-                        ('PADDING', (0,0), (-1,-1), 1),
-                    ]))
-                    story.append(page_tbl)
-                    if page_start + page_capacity < len(players):
-                        story.append(PageBreak())
+            out_io = io.BytesIO()
+            final_im.save(out_io, format='JPEG', quality=88, optimize=True)
+            jpeg_bytes = out_io.getvalue()
 
-            doc.build(story)
-            out.seek(0)
-            response = HttpResponse(out.getvalue(), content_type='application/pdf')
-            response['Content-Disposition'] = f'attachment; filename="{auction_name}_Player_Cards.pdf"'
-            return response
-        except ImportError:
-            # 2. Pure Python zero-dependency PDF generator fallback
-            from django.http import HttpResponse
-            pdf_bytes = self._generate_pure_cards_pdf(auction_name, players, cols, rows, pdf_format, pdf_settings)
-            response = HttpResponse(pdf_bytes, content_type='application/pdf')
-            response['Content-Disposition'] = f'attachment; filename="{auction_name}_Player_Cards.pdf"'
-            return response
-        except Exception as exc:
-            from django.http import HttpResponse
-            pdf_bytes = self._generate_pure_cards_pdf(auction_name, players, cols, rows, pdf_format, pdf_settings)
-            response = HttpResponse(pdf_bytes, content_type='application/pdf')
-            response['Content-Disposition'] = f'attachment; filename="{auction_name}_Player_Cards.pdf"'
-            return response
+            return {
+                'bytes': jpeg_bytes,
+                'width': orig_w,
+                'height': orig_h,
+            }
+        except Exception as e:
+            print(f"[PDF Engine] Failed to process image: {e}")
+            return None
 
     def _generate_pure_cards_pdf(self, auction_name, players, cols=3, rows=5, pdf_format='category', pdf_settings=None):
         from collections import defaultdict
         width, height = 595.28, 841.89  # A4 in points (210mm x 297mm)
-        margin = 22.0  # ~8mm margin
+        margin = 18.0
+        header_h = 24.0
         usable_w = width - (2 * margin)
-        usable_h = height - (2 * margin) - 26.0  # leave room for header
+        usable_h = height - (2 * margin) - header_h - 10.0
         card_w = usable_w / max(1, cols)
         card_h = usable_h / max(1, rows)
         page_capacity = cols * rows
@@ -1589,46 +1473,139 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
         cfg_elements = cfg.get('elements', {})
         branding = cfg.get('branding', {})
         show_t_name = branding.get('show_tournament_name', True)
-        title_mode = branding.get('title_mode', 'Text')
         t_title = branding.get('tournament_title') or auction_name or 'Turf Tournament'
 
         card_fill_hex = cfg.get('card_fill', '#FFFFFF')
         accent_hex = cfg.get('accent_colour', '#2563EB')
 
         def hex_to_rgb(h):
-            h = h.lstrip('#')
+            h = str(h or '').lstrip('#')
             if len(h) == 6:
-                return tuple(int(h[i:i+2], 16) / 255.0 for i in (0, 2, 4))
-            return (0.15, 0.39, 0.92)
+                try:
+                    return tuple(int(h[i:i+2], 16) / 255.0 for i in (0, 2, 4))
+                except ValueError:
+                    pass
+            return (0.145, 0.388, 0.922)
 
         accent_r, accent_g, accent_b = hex_to_rgb(accent_hex)
         fill_r, fill_g, fill_b = hex_to_rgb(card_fill_hex)
 
         def esc(t):
-            cleaned = "".join([c if ord(c) < 128 else ' ' for c in str(t or '')])
+            s = str(t or '').replace('₹', 'Rs. ')
+            cleaned = "".join([c if ord(c) < 128 else ' ' for c in s])
             return cleaned.replace('\\', '\\\\').replace('(', '\\(').replace(')', '\\)')
 
-        def is_selected(k, def_val=True):
-            if k in cfg_elements:
-                return cfg_elements[k].get('selected', def_val)
-            return def_val
+        # 1. Prepare Background Image / Watermark
+        bg_image_data = (
+            branding.get('pageBackgroundImage') or
+            branding.get('page_background_image') or
+            cfg.get('pageBackgroundImage')
+        )
+        bg_opacity_raw = branding.get('pageBackgroundOpacity', 20)
+        try:
+            bg_opacity = float(bg_opacity_raw) / 100.0
+        except (ValueError, TypeError):
+            bg_opacity = 0.20
 
-        def has_lbl(k, def_val=False):
-            if k in cfg_elements:
-                return cfg_elements[k].get('show_label', def_val)
-            return def_val
+        images_dict = {}
+        bg_info = None
+        if bg_image_data:
+            bg_info = self._process_image_to_jpeg_dict(bg_image_data, opacity=bg_opacity)
+            if bg_info:
+                images_dict['/ImBg'] = bg_info
+
+        # 2. Prepare Draggable Logos
+        placed_logos = (
+            branding.get('placedLogos') or
+            branding.get('logos') or
+            cfg.get('placedLogos') or
+            []
+        )
+        if not placed_logos:
+            single_logo = (
+                branding.get('customLogoUrl') or
+                branding.get('logoUrl') or
+                branding.get('title_image_url')
+            )
+            if single_logo:
+                placed_logos = [{
+                    'url': single_logo,
+                    'x': float(branding.get('logoX', 4)),
+                    'y': float(branding.get('logoY', 1.5)),
+                    'width': float(branding.get('logoWidth', 10)),
+                }]
+
+        prepared_logos = []
+        for idx, l_item in enumerate(placed_logos):
+            l_url = l_item.get('url') or l_item.get('data')
+            if not l_url:
+                continue
+            logo_info = self._process_image_to_jpeg_dict(l_url, opacity=1.0)
+            if logo_info:
+                img_ref = f"/ImLogo{idx}"
+                images_dict[img_ref] = logo_info
+                try:
+                    prepared_logos.append({
+                        'ref': img_ref,
+                        'info': logo_info,
+                        'x_pct': float(l_item.get('x', 4)),
+                        'y_pct': float(l_item.get('y', 1.5)),
+                        'w_pct': float(l_item.get('width', 10)),
+                    })
+                except (ValueError, TypeError):
+                    continue
+
+        # 3. Default element coordinates matching design studio
+        layout_defaults = {
+            'player_number': {'selected': True, 'x': 38, 'y': 6, 'w': 24, 'h': 12, 'font_size': 13, 'colour': '#0284c7', 'bold': True, 'show_label': False},
+            'player_photo': {'selected': True, 'x': 4, 'y': 6, 'w': 30, 'h': 86, 'font_size': 10, 'colour': '#000000', 'bold': False, 'show_label': True},
+            'name': {'selected': True, 'x': 38, 'y': 19, 'w': 58, 'h': 14, 'font_size': 13, 'colour': '#0f172a', 'bold': True, 'show_label': False},
+            'category': {'selected': True, 'x': 62, 'y': 6, 'w': 34, 'h': 12, 'font_size': 10, 'colour': '#7c3aed', 'bold': True, 'show_label': False, 'align': 'right'},
+            'role': {'selected': True, 'x': 38, 'y': 32, 'w': 58, 'h': 12, 'font_size': 9.5, 'colour': '#334155', 'bold': False, 'show_label': False},
+            'base_price': {'selected': True, 'x': 38, 'y': 44, 'w': 58, 'h': 14, 'font_size': 10.5, 'colour': '#16a34a', 'bold': True, 'show_label': True},
+            'location': {'selected': True, 'x': 38, 'y': 59, 'w': 28, 'h': 10, 'font_size': 8.5, 'colour': '#64748b', 'bold': False, 'show_label': True},
+            'batting': {'selected': True, 'x': 68, 'y': 59, 'w': 28, 'h': 10, 'font_size': 8.5, 'colour': '#64748b', 'bold': False, 'show_label': True},
+            'bowling': {'selected': True, 'x': 38, 'y': 71, 'w': 28, 'h': 10, 'font_size': 8.5, 'colour': '#64748b', 'bold': False, 'show_label': True},
+            'mobile': {'selected': True, 'x': 68, 'y': 71, 'w': 28, 'h': 10, 'font_size': 8.5, 'colour': '#64748b', 'bold': False, 'show_label': True},
+            'age': {'selected': True, 'x': 38, 'y': 83, 'w': 18, 'h': 10, 'font_size': 8.5, 'colour': '#64748b', 'bold': False, 'show_label': True},
+            'experience': {'selected': True, 'x': 57, 'y': 83, 'w': 20, 'h': 10, 'font_size': 8.5, 'colour': '#64748b', 'bold': False, 'show_label': True},
+            'application_id': {'selected': True, 'x': 78, 'y': 83, 'w': 18, 'h': 10, 'font_size': 8.5, 'colour': '#64748b', 'bold': False, 'show_label': True},
+        }
 
         pages = []
 
         def build_page_stream(page_players, section_title):
             cmds = []
-            # Header banner
-            cmds.append(f"0.96 0.97 0.99 rg {margin:.1f} {height - margin - 20:.1f} {usable_w:.1f} 20 re f")
-            cmds.append(f"{accent_r:.3f} {accent_g:.3f} {accent_b:.3f} rg {margin:.1f} {height - margin - 20:.1f} {usable_w:.1f} 2 re f")
-            
-            hdr_text = f"{t_title}   |   {section_title}" if show_t_name else section_title
-            cmds.append(f"BT /F2 10 Tf 0.08 0.12 0.20 rg {margin + 8:.1f} {height - margin - 14:.1f} Td ({esc(hdr_text)}) Tj ET")
 
+            # (A) Page Background Image / Watermark with Opacity
+            if bg_info:
+                cmds.append(f"q {width:.2f} 0 0 {height:.2f} 0 0 cm /ImBg Do Q")
+
+            # (B) Sheet Header Banner
+            cmds.append(f"0.96 0.97 0.99 rg {margin:.1f} {height - margin - header_h:.1f} {usable_w:.1f} {header_h:.1f} re f")
+            cmds.append(f"{accent_r:.3f} {accent_g:.3f} {accent_b:.3f} rg {margin:.1f} {height - margin - header_h:.1f} {usable_w:.1f} 2.0 re f")
+
+            hdr_left = f"{t_title}   |   {section_title}" if show_t_name else section_title
+            cmds.append(f"BT /F2 10.5 Tf 0.08 0.12 0.20 rg {margin + 8:.1f} {height - margin - 16:.1f} Td ({esc(hdr_left)}) Tj ET")
+
+            hdr_right = "Every category on new page" if pdf_format == 'category' else "Continuous order"
+            right_x = margin + usable_w - (len(hdr_right) * 5.2) - 8
+            cmds.append(f"BT /F1 8.5 Tf 0.40 0.45 0.55 rg {right_x:.1f} {height - margin - 15:.1f} Td ({esc(hdr_right)}) Tj ET")
+
+            # (C) Render Draggable Logos
+            for l_entry in prepared_logos:
+                w_px = l_entry['info']['width']
+                h_px = l_entry['info']['height']
+                aspect = float(h_px) / float(w_px) if w_px > 0 else 1.0
+
+                lw_pt = (l_entry['w_pct'] / 100.0) * width
+                lh_pt = lw_pt * aspect
+                lx_pt = (l_entry['x_pct'] / 100.0) * width
+                ly_pt = height - ((l_entry['y_pct'] / 100.0) * height) - lh_pt
+
+                cmds.append(f"q {lw_pt:.2f} 0 0 {lh_pt:.2f} {lx_pt:.2f} {ly_pt:.2f} cm {l_entry['ref']} Do Q")
+
+            # (D) Card Grid
             for r in range(rows):
                 for c in range(cols):
                     idx = (r * cols) + c
@@ -1636,20 +1613,21 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                         continue
                     p = page_players[idx]
                     card_x = margin + (c * card_w)
-                    card_y = height - margin - 26 - ((r + 1) * card_h)
+                    card_y = height - margin - header_h - 6.0 - ((r + 1) * card_h)
                     cx = card_x + 2.5
                     cy = card_y + 2.5
                     cw = card_w - 5.0
                     ch = card_h - 5.0
+                    card_top = cy + ch
 
                     # Card fill & border
                     cmds.append(f"{fill_r:.3f} {fill_g:.3f} {fill_b:.3f} rg {accent_r:.3f} {accent_g:.3f} {accent_b:.3f} RG 0.8 w {cx:.1f} {cy:.1f} {cw:.1f} {ch:.1f} re B")
                     
                     # Top accent bar
-                    cmds.append(f"{accent_r:.3f} {accent_g:.3f} {accent_b:.3f} rg {cx:.1f} {cy + ch - 3.5:.1f} {cw:.1f} 3.5 re f")
+                    cmds.append(f"{accent_r:.3f} {accent_g:.3f} {accent_b:.3f} rg {cx:.1f} {card_top - 3.5:.1f} {cw:.1f} 3.5 re f")
 
-                    name = getattr(p, 'name', None) or (p.player.full_name if getattr(p, 'player', None) else 'Player')
                     serial = getattr(p, 'serial_no', '—')
+                    name = getattr(p, 'name', None) or (p.player.full_name if getattr(p, 'player', None) else 'Player')
                     role = getattr(p, 'role', 'Player') or 'Player'
                     cat = getattr(p, 'tier', None) or getattr(p, 'category', None) or 'General'
                     price = getattr(p, 'base_price', 2000) or 2000
@@ -1662,91 +1640,89 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                     exp = getattr(p, 'experience', '') or cdata.get('experience') or ''
                     app_id = cdata.get('application_id') or str(getattr(p, 'id', ''))[:8]
 
-                    # Photo Box on left
-                    photo_w = 34.0
-                    photo_h = min(ch - 14.0, 48.0)
-                    photo_x = cx + 4.0
-                    photo_y = cy + ch - photo_h - 7.0
-                    if is_selected('player_photo', True):
-                        cmds.append(f"0.92 0.94 0.96 rg 0.78 0.82 0.88 RG 0.5 w {photo_x:.1f} {photo_y:.1f} {photo_w:.1f} {photo_h:.1f} re B")
-                        cmds.append(f"BT /F1 7.0 Tf 0.45 0.50 0.58 rg {photo_x + 6.0:.1f} {photo_y + (photo_h/2) - 2.5:.1f} Td (PHOTO) Tj ET")
-                        text_x = photo_x + photo_w + 5.0
-                        text_w = cw - photo_w - 12.0
-                    else:
-                        text_x = cx + 5.0
-                        text_w = cw - 10.0
+                    # Render each element by relative % position to prevent any overlaps
+                    for el_key, def_cfg in layout_defaults.items():
+                        cfg_el = cfg_elements.get(el_key, {})
+                        el = {**def_cfg, **cfg_el}
+                        if not el.get('selected', True):
+                            continue
 
-                    # 1. Serial No & Category
-                    curr_y = cy + ch - 12.0
-                    badge_parts = []
-                    if is_selected('player_number', True):
-                        lbl = 'No: ' if has_lbl('player_number', False) else '#'
-                        badge_parts.append(f"{lbl}{serial}")
-                    if is_selected('category', True):
-                        lbl = 'Cat: ' if has_lbl('category', False) else ''
-                        badge_parts.append(f"[{lbl}{cat}]")
-                    if badge_parts:
-                        badge_str = "  ".join(badge_parts)
-                        cmds.append(f"BT /F2 8.0 Tf {accent_r:.3f} {accent_g:.3f} {accent_b:.3f} rg {text_x:.1f} {curr_y:.1f} Td ({esc(badge_str)[:25]}) Tj ET")
-                        curr_y -= 10.5
+                        el_x = cx + (float(el['x']) / 100.0) * cw
+                        el_w = (float(el['w']) / 100.0) * cw
+                        el_h = (float(el['h']) / 100.0) * ch
+                        el_y_top = card_top - (float(el['y']) / 100.0) * ch
+                        el_y_bottom = el_y_top - el_h
 
-                    # 2. Player Name
-                    if is_selected('name', True):
-                        lbl = 'Name: ' if has_lbl('name', False) else ''
-                        cmds.append(f"BT /F2 9.5 Tf 0.06 0.09 0.16 rg {text_x:.1f} {curr_y:.1f} Td ({esc(lbl + str(name))[:22]}) Tj ET")
-                        curr_y -= 9.5
+                        if el_key == 'player_photo':
+                            cmds.append(f"0.93 0.95 0.97 rg 0.78 0.82 0.88 RG 0.5 w {el_x:.1f} {el_y_bottom:.1f} {el_w:.1f} {el_h:.1f} re B")
+                            ph_tx = el_x + max(2.0, (el_w - 28.0) / 2.0)
+                            ph_ty = el_y_bottom + (el_h / 2.0) - 3.0
+                            cmds.append(f"BT /F2 8.5 Tf 0.45 0.50 0.60 rg {ph_tx:.1f} {ph_ty:.1f} Td (PHOTO) Tj ET")
 
-                    # 3. Role
-                    if is_selected('role', True):
-                        lbl = 'Role: ' if has_lbl('role', False) else ''
-                        cmds.append(f"BT /F1 7.5 Tf 0.30 0.35 0.45 rg {text_x:.1f} {curr_y:.1f} Td ({esc(lbl + str(role))[:25]}) Tj ET")
-                        curr_y -= 9.0
+                        elif el_key == 'player_number':
+                            lbl = 'No: ' if el.get('show_label', False) else '#'
+                            val_text = f"{lbl}{serial}"
+                            f_sz = max(8.0, min(12.0, float(el.get('font_size', 13)) * 0.75))
+                            ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
+                            c_r, c_g, c_b = hex_to_rgb(el.get('colour', '#0284c7'))
+                            cmds.append(f"BT /F2 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)}) Tj ET")
 
-                    # 4. Base Price Box
-                    if is_selected('base_price', True):
-                        price_box_y = max(cy + 4.0, curr_y - 12.0)
-                        lbl = 'Base Price: ' if has_lbl('base_price', True) else 'Base: '
-                        cmds.append(f"0.92 0.98 0.94 rg 0.70 0.90 0.75 RG 0.5 w {text_x:.1f} {price_box_y:.1f} {text_w:.1f} 11 re B")
-                        cmds.append(f"BT /F2 7.5 Tf 0.086 0.639 0.290 rg {text_x + 3.0:.1f} {price_box_y + 3.0:.1f} Td ({esc(lbl)}Rs. {int(price):,}) Tj ET")
-                        curr_y = price_box_y - 2.0
+                        elif el_key == 'category':
+                            lbl = 'Cat: ' if el.get('show_label', False) else ''
+                            val_text = f"[{lbl}{cat}]"
+                            f_sz = max(7.0, min(10.0, float(el.get('font_size', 10)) * 0.72))
+                            ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
+                            c_r, c_g, c_b = hex_to_rgb(el.get('colour', '#7c3aed'))
+                            text_len_est = len(val_text) * f_sz * 0.52
+                            tx = max(el_x, el_x + el_w - text_len_est) if el.get('align') == 'right' else el_x
+                            cmds.append(f"BT /F2 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {tx:.1f} {ty:.1f} Td ({esc(val_text)}) Tj ET")
 
-                    # 5. Batting & Bowling
-                    specs = []
-                    if is_selected('batting', True) and bat:
-                        lbl = 'Bat: ' if has_lbl('batting', True) else ''
-                        specs.append(f"{lbl}{bat}")
-                    if is_selected('bowling', True) and bowl:
-                        lbl = 'Bowl: ' if has_lbl('bowling', True) else ''
-                        specs.append(f"{lbl}{bowl}")
-                    if specs and curr_y > cy + 14.0:
-                        cmds.append(f"BT /F1 6.5 Tf 0.35 0.40 0.48 rg {cx + 4.0:.1f} {curr_y:.1f} Td ({esc(' • '.join(specs))[:36]}) Tj ET")
-                        curr_y -= 8.0
+                        elif el_key == 'name':
+                            lbl = 'Name: ' if el.get('show_label', False) else ''
+                            val_text = f"{lbl}{name}"
+                            f_sz = max(9.0, min(13.0, float(el.get('font_size', 13)) * 0.75))
+                            ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
+                            c_r, c_g, c_b = hex_to_rgb(el.get('colour', '#0f172a'))
+                            cmds.append(f"BT /F2 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)[:24]}) Tj ET")
 
-                    # 6. Location, Age, Mobile
-                    info_line = []
-                    if is_selected('location', True) and loc:
-                        lbl = 'Loc: ' if has_lbl('location', True) else ''
-                        info_line.append(f"{lbl}{loc}")
-                    if is_selected('age', True) and age:
-                        lbl = 'Age: ' if has_lbl('age', True) else ''
-                        info_line.append(f"{lbl}{age}")
-                    if is_selected('mobile', True) and mob:
-                        lbl = 'Mob: ' if has_lbl('mobile', True) else ''
-                        info_line.append(f"{lbl}{mob}")
-                    if info_line and curr_y > cy + 10.0:
-                        cmds.append(f"BT /F1 6.0 Tf 0.40 0.45 0.52 rg {cx + 4.0:.1f} {curr_y:.1f} Td ({esc(' | '.join(info_line))[:38]}) Tj ET")
-                        curr_y -= 7.5
+                        elif el_key == 'role':
+                            lbl = 'Role: ' if el.get('show_label', False) else ''
+                            val_text = f"{lbl}{role}"
+                            f_sz = max(7.0, min(9.5, float(el.get('font_size', 9.5)) * 0.72))
+                            ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
+                            c_r, c_g, c_b = hex_to_rgb(el.get('colour', '#334155'))
+                            cmds.append(f"BT /F1 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)[:26]}) Tj ET")
 
-                    # 7. Experience & Application ID
-                    id_line = []
-                    if is_selected('experience', True) and exp:
-                        lbl = 'Exp: ' if has_lbl('experience', True) else ''
-                        id_line.append(f"{lbl}{exp}")
-                    if is_selected('application_id', True) and app_id:
-                        lbl = 'ID: ' if has_lbl('application_id', True) else ''
-                        id_line.append(f"{lbl}{app_id}")
-                    if id_line and curr_y > cy + 3.0:
-                        cmds.append(f"BT /F1 6.0 Tf 0.48 0.52 0.60 rg {cx + 4.0:.1f} {curr_y:.1f} Td ({esc(' | '.join(id_line))[:38]}) Tj ET")
+                        elif el_key == 'base_price':
+                            lbl = 'Base Price: ' if el.get('show_label', True) else 'Base: '
+                            val_text = f"{lbl}Rs. {int(price):,}"
+                            pill_h = el_h - 1.5
+                            pill_y = el_y_bottom + 0.75
+                            cmds.append(f"0.92 0.98 0.94 rg 0.70 0.88 0.75 RG 0.5 w {el_x:.1f} {pill_y:.1f} {el_w:.1f} {pill_h:.1f} re B")
+                            f_sz = max(7.0, min(10.5, float(el.get('font_size', 10.5)) * 0.75))
+                            ty = pill_y + (pill_h / 2.0) - (f_sz * 0.35)
+                            cmds.append(f"BT /F2 {f_sz:.1f} Tf 0.086 0.639 0.290 rg {el_x + 3.0:.1f} {ty:.1f} Td ({esc(val_text)}) Tj ET")
+
+                        else:
+                            # 2-column detail specs
+                            val_raw = ''
+                            default_lbl = ''
+                            if el_key == 'location': val_raw = loc; default_lbl = 'Loc: '
+                            elif el_key == 'batting': val_raw = bat; default_lbl = 'Bat: '
+                            elif el_key == 'bowling': val_raw = bowl; default_lbl = 'Bowl: '
+                            elif el_key == 'mobile': val_raw = mob; default_lbl = 'Mob: '
+                            elif el_key == 'age': val_raw = str(age); default_lbl = 'Age: '
+                            elif el_key == 'experience': val_raw = str(exp); default_lbl = 'Exp: '
+                            elif el_key == 'application_id': val_raw = str(app_id); default_lbl = 'ID: '
+
+                            if val_raw:
+                                lbl = default_lbl if el.get('show_label', True) else ''
+                                val_text = f"{lbl}{val_raw}"
+                                f_sz = max(6.0, min(8.5, float(el.get('font_size', 8.5)) * 0.70))
+                                ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
+                                c_r, c_g, c_b = hex_to_rgb(el.get('colour', '#64748b'))
+                                font_choice = '/F2' if el.get('bold', False) else '/F1'
+                                cmds.append(f"BT {font_choice} {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)[:18]}) Tj ET")
 
             return "\n".join(cmds)
 
@@ -1769,36 +1745,66 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 page_label = f"Auction Format (Lots {p_idx + 1} - {min(len(players), p_idx + page_capacity)} of {len(players)})"
                 pages.append(build_page_stream(p_slice, page_label))
 
-        return self._assemble_raw_pdf(pages, width, height)
+        return self._assemble_raw_pdf(pages, width, height, images_dict)
 
-    def _assemble_raw_pdf(self, pages_streams, width=595.28, height=841.89):
+    def _assemble_raw_pdf(self, pages_streams, width=595.28, height=841.89, images_dict=None):
         num_pages = len(pages_streams)
         if num_pages == 0:
             pages_streams = [""]
             num_pages = 1
 
-        page_obj_ids = [5 + 2 * i for i in range(num_pages)]
-        kids_str = " ".join([f"{pid} 0 R" for pid in page_obj_ids])
-
         objects = {}
         objects[1] = f"<< /Type /Catalog /Pages 2 0 R >>"
-        objects[2] = f"<< /Type /Pages /Kids [{kids_str}] /Count {num_pages} >>"
         objects[3] = f"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
         objects[4] = f"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>"
 
-        for i, stream_text in enumerate(pages_streams):
-            pid = 5 + 2 * i
-            cid = 6 + 2 * i
+        # Register Image XObjects (/Filter /DCTDecode for JPEG)
+        images_dict = images_dict or {}
+        img_name_to_obj_id = {}
+        next_obj_id = 5
+        for img_name, img_data in images_dict.items():
+            img_obj_id = next_obj_id
+            next_obj_id += 1
+            img_name_to_obj_id[img_name] = img_obj_id
+            raw_jpeg = img_data['bytes']
+            w = img_data['width']
+            h = img_data['height']
+            header_str = (
+                f"<< /Type /XObject /Subtype /Image /Width {w} /Height {h} "
+                f"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode "
+                f"/Length {len(raw_jpeg)} >>\nstream\n"
+            )
+            objects[img_obj_id] = header_str.encode('latin1') + raw_jpeg + b"\nendstream"
+
+        if img_name_to_obj_id:
+            xobj_entries = " ".join([f"{name} {oid} 0 R" for name, oid in img_name_to_obj_id.items()])
+            xobj_res = f"/XObject << {xobj_entries} >>"
+        else:
+            xobj_res = ""
+
+        # Build Page and Content stream objects
+        page_obj_ids = []
+        for i in range(num_pages):
+            pid = next_obj_id
+            cid = next_obj_id + 1
+            next_obj_id += 2
+            page_obj_ids.append(pid)
+
+            stream_text = pages_streams[i]
+            s_bytes = stream_text.encode('latin1', errors='replace')
+
             objects[pid] = (
                 f"<< /Type /Page /Parent 2 0 R "
                 f"/MediaBox [0 0 {width:.2f} {height:.2f}] "
                 f"/Contents {cid} 0 R "
-                f"/Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> >>"
+                f"/Resources << /Font << /F1 3 0 R /F2 4 0 R >> {xobj_res} >> >>"
             )
-            s_bytes = stream_text.encode('latin1', errors='replace')
             objects[cid] = (
                 f"<< /Length {len(s_bytes)} >>\nstream\n".encode('latin1') + s_bytes + b"\nendstream"
             )
+
+        kids_str = " ".join([f"{pid} 0 R" for pid in page_obj_ids])
+        objects[2] = f"<< /Type /Pages /Kids [{kids_str}] /Count {num_pages} >>"
 
         out = bytearray()
         out.extend(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
