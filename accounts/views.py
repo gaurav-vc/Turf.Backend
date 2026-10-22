@@ -225,10 +225,65 @@ class UserViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Updat
             return UserUpdateSerializer
         return UserSerializer
 
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get', 'patch', 'put'], permission_classes=[IsAuthenticated])
     def me(self, request):
-        serializer = self.get_serializer(request.user)
+        user = request.user
+        if request.method in ['PATCH', 'PUT']:
+            data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
+            avatar_file = request.FILES.get('avatar_file') or request.FILES.get('avatar')
+            avatar_val = data.get('avatar')
+
+            if avatar_file:
+                import os, uuid
+                from django.conf import settings
+                from django.core.files.storage import default_storage
+                ext = os.path.splitext(avatar_file.name)[1] or '.png'
+                filename = f"avatars/user_{user.id}_{uuid.uuid4().hex[:8]}{ext}"
+                saved_path = default_storage.save(filename, avatar_file)
+                data['avatar'] = request.build_absolute_uri(f"{settings.MEDIA_URL}{saved_path}")
+            elif avatar_val and str(avatar_val).startswith('data:'):
+                import uuid, base64
+                from django.conf import settings
+                from django.core.files.base import ContentFile
+                from django.core.files.storage import default_storage
+                try:
+                    format_header, img_str = str(avatar_val).split(';base64,', 1)
+                    ext = format_header.split('/')[-1] if '/' in format_header else 'png'
+                    if '+' in ext:
+                        ext = ext.split('+')[0]
+                    file_data = base64.b64decode(img_str)
+                    filename = f"avatars/user_{user.id}_{uuid.uuid4().hex[:8]}.{ext}"
+                    saved_path = default_storage.save(filename, ContentFile(file_data))
+                    data['avatar'] = request.build_absolute_uri(f"{settings.MEDIA_URL}{saved_path}")
+                except Exception as err:
+                    print(f"Failed to decode base64 avatar: {err}")
+
+            serializer = UserUpdateSerializer(user, data=data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(UserSerializer(user).data)
+
+        serializer = UserSerializer(user)
         return Response(serializer.data)
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
+    def upload_avatar(self, request):
+        user = request.user
+        avatar_file = request.FILES.get('avatar') or request.FILES.get('avatar_file')
+        if not avatar_file:
+            return Response({'error': 'No image file provided'}, status=400)
+
+        import os, uuid
+        from django.conf import settings
+        from django.core.files.storage import default_storage
+
+        ext = os.path.splitext(avatar_file.name)[1] or '.png'
+        filename = f"avatars/user_{user.id}_{uuid.uuid4().hex[:8]}{ext}"
+        saved_path = default_storage.save(filename, avatar_file)
+        avatar_url = request.build_absolute_uri(f"{settings.MEDIA_URL}{saved_path}")
+        user.avatar = avatar_url
+        user.save(update_fields=['avatar'])
+        return Response({'avatar': avatar_url, 'user': UserSerializer(user).data})
 
 from .models import Notification
 from .serializers import NotificationSerializer
