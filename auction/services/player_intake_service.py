@@ -101,21 +101,29 @@ class PlayerIntakeService:
                                 return str(val).strip()
                     return ""
 
-                name = get_val('name', 'player name', 'player_name', 'fullname')
+                name = get_val('name', 'player name', 'player_name', 'fullname', 'player', 'full name', 'first name')
                 if not name:
-                    continue # Skip empty name rows
+                    # If specific name column is missing, inspect row values for first non-numeric text
+                    for k, v in row.items():
+                        s_v = str(v or '').strip()
+                        if s_v and not s_v.isdigit() and len(s_v) > 2 and '@' not in s_v:
+                            name = s_v
+                            break
+                if not name:
+                    continue # Skip truly empty rows
 
-                mobile = get_val('mobile', 'phone', 'contact', 'mobile number')
-                cat_name = get_val('category', 'player category', 'cat') or "General"
-                role_name = get_val('role', 'player role', 'skill', 'skills') or "All-Rounder"
-                batting = get_val('batting style', 'batting', 'batting_style')
-                bowling = get_val('bowling style', 'bowling', 'bowling_style')
-                location = get_val('location', 'city', 'area')
-                photo_url = get_val('photo url', 'photo', 'image', 'photo_url')
-                base_raw = get_val('base price', 'base_price', 'price')
+                mobile = get_val('mobile', 'phone', 'contact', 'mobile number', 'phone number', 'whatsapp')
+                cat_name = get_val('category', 'player category', 'cat', 'tier', 'group') or "General"
+                role_name = get_val('role', 'player role', 'skill', 'skills', 'primary skill', 'position') or "All-Rounder"
+                batting = get_val('batting style', 'batting', 'batting_style', 'batsman') or "Right Hand Bat"
+                bowling = get_val('bowling style', 'bowling', 'bowling_style', 'bowler') or "Right Arm Medium"
+                location = get_val('location', 'city', 'area', 'address', 'state') or ""
+                photo_url = get_val('photo url', 'photo', 'image', 'photo_url', 'picture', 'avatar') or ""
+                base_raw = get_val('base price', 'base_price', 'price', 'base', 'purse', 'amount')
                 
                 try:
-                    base_price = Decimal(str(base_raw).replace(',', '')) if base_raw else Decimal('1000.00')
+                    cleaned_price = str(base_raw or '').replace(',', '').replace('₹', '').replace('Rs.', '').replace('Rs', '').strip()
+                    base_price = Decimal(cleaned_price) if cleaned_price else Decimal('1000.00')
                 except Exception:
                     base_price = Decimal('1000.00')
 

@@ -24,7 +24,28 @@ class AuctionViewSet(viewsets.ModelViewSet):
         qs = super().get_queryset()
         tournament_id = self.request.query_params.get('tournament')
         if tournament_id:
-            qs = qs.filter(tournament_id=tournament_id)
+            filtered = qs.filter(tournament_id=tournament_id)
+            if not filtered.exists():
+                # Check if tournament exists; if so, automatically initialize auction for this tournament
+                tourn = Tournament.objects.filter(id=tournament_id).first()
+                if tourn:
+                    created_auction = Auction.objects.create(
+                        name=f"{tourn.name} Auction",
+                        organizer=self.request.user if self.request.user.is_authenticated else tourn.organizer,
+                        tournament=tourn,
+                        base_budget=50000.00,
+                        status='ACTIVE'
+                    )
+                    # Automatically link tournament teams as franchise auction teams if any
+                    for tt in tourn.tournament_teams.select_related('team').all():
+                        if tt.team:
+                            AuctionTeam.objects.get_or_create(
+                                auction=created_auction,
+                                team=tt.team,
+                                defaults={'remaining_budget': 50000.00}
+                            )
+                    return Auction.objects.filter(id=created_auction.id)
+            return filtered
         return qs
 
     def perform_create(self, serializer):

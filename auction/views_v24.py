@@ -1150,9 +1150,23 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 card_number = request.data.get('card_number')
                 team_id = request.data.get('team_id')
                 card = auction.group_cards.filter(card_number=card_number).first()
-                team = auction.teams.filter(id=team_id).first()
-                if card and team:
-                    card.team = team
+                if card:
+                    if team_id:
+                        team = auction.teams.filter(id=team_id).first()
+                        if team:
+                            card.team = team
+                            card.save()
+                    else:
+                        card.team = None
+                        card.revealed = False
+                        card.save()
+
+            elif draw_action == 'unassign':
+                card_number = request.data.get('card_number')
+                card = auction.group_cards.filter(card_number=card_number).first()
+                if card:
+                    card.team = None
+                    card.revealed = False
                     card.save()
 
             elif draw_action == 'reveal':
@@ -1161,6 +1175,12 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 if card:
                     card.revealed = True
                     card.save()
+
+            elif draw_action == 'reveal_all':
+                auction.group_cards.all().update(revealed=True)
+
+            elif draw_action == 'hide_all':
+                auction.group_cards.all().update(revealed=False)
 
             elif draw_action == 'reset':
                 auction.group_cards.all().delete()
@@ -1490,6 +1510,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
         show_footer = footer_cfg.get('show', False)
         footer_h = float(footer_cfg.get('height', 20.0)) if show_footer else 0.0
 
+        margin = float(cfg.get('margin', 15.0))
         usable_w = width - (2 * margin)
         usable_h = height - (2 * margin) - header_h - footer_h - 10.0
         card_w = usable_w / max(1, cols)
@@ -2821,6 +2842,26 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             elif 'highest_bid_animation_custom_url' in data:
                 extended['highest_bid_animation_custom'] = str(data.get('highest_bid_animation_custom_url', '')).strip()
 
+            # Group Card Flip Animation & Revealed Card Background
+            if data.get('group_card_animation'):
+                extended['group_card_animation'] = str(data.get('group_card_animation')).strip()
+            if 'group_draw_animation_enabled' in data:
+                extended['group_draw_animation_enabled'] = str(data.get('group_draw_animation_enabled')).lower() in ['true', '1']
+
+            if 'group_card_bg_image' in request.FILES:
+                bg_file = request.FILES['group_card_bg_image']
+                try:
+                    ext = os.path.splitext(bg_file.name)[1]
+                    safe_name = f"group_card_bg_{auction.id}_{int(time.time())}{ext}"
+                    saved_path = default_storage.save(f"auction/branding/{safe_name}", bg_file)
+                    extended['group_card_bg_image'] = request.build_absolute_uri(settings.MEDIA_URL + saved_path)
+                except Exception as e:
+                    print("Group card background upload error:", e)
+            elif 'group_card_bg_image' in data:
+                extended['group_card_bg_image'] = str(data.get('group_card_bg_image', '')).strip()
+            elif 'group_card_bg_image_url' in data:
+                extended['group_card_bg_image'] = str(data.get('group_card_bg_image_url', '')).strip()
+
             config.save()
             design_json['setup_rules_extended'] = extended
             design.design_json = design_json
@@ -2897,6 +2938,9 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 'group_count': len(groups),
                 'groups': groups,
                 'group_card_colour': extended.get('group_card_colour', '#FFFFFF'),
+                'group_card_animation': extended.get('group_card_animation', '3D Flip Horizontal'),
+                'group_card_bg_image': extended.get('group_card_bg_image', ''),
+                'group_draw_animation_enabled': extended.get('group_draw_animation_enabled', True),
                 'tournament_logo': config.tournament_logo or '',
                 'auction_background': config.auction_background or 'stadium',
                 'overall_background': config.overall_background or 'default',
