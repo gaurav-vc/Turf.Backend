@@ -185,6 +185,12 @@ class AuctionPlayerViewSet(viewsets.ModelViewSet):
         auction_id = self.request.query_params.get('auction')
         if auction_id:
             qs = qs.filter(auction_id=auction_id)
+        category = self.request.query_params.get('category')
+        if category and category.strip() and category.upper() != 'ALL':
+            qs = qs.filter(category__iexact=category.strip())
+        status_param = self.request.query_params.get('status')
+        if status_param and status_param.strip():
+            qs = qs.filter(status__iexact=status_param.strip())
         return qs
 
     def partial_update(self, request, *args, **kwargs):

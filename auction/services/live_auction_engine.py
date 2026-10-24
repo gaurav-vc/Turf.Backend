@@ -5,7 +5,7 @@ Ported from Cricket Auction Phase 2 V24 authoritative logic.
 from decimal import Decimal
 from django.db import transaction
 from ..models import Auction, AuctionTeam, AuctionPlayer, Bid
-from ..models_v24 import AuctionEventLog, TeamPurseTransaction
+from ..models_v24 import AuctionEventLog, TeamPurseTransaction, AuctionCategory
 from .max_bid_calculator import (
     team_financials, 
     bid_increment, 
@@ -322,14 +322,15 @@ class LiveAuctionEngine:
         """
         Puts a specific player on block by serial_no.
         """
-        player = auction.players.filter(serial_no=serial_no, status__in=['AVAILABLE', 'UNSOLD']).first()
+        player = auction.players.filter(serial_no=serial_no, status__in=['AVAILABLE', 'PENDING', 'UNSOLD']).first()
         if not player:
             return False, f"Player with Serial No. {serial_no} is not available."
 
         with transaction.atomic():
-            if auction.active_player:
-                auction.active_player.status = 'AVAILABLE'
-                auction.active_player.save()
+            if auction.active_player and auction.active_player.id != player.id:
+                if auction.active_player.status == 'BIDDING':
+                    auction.active_player.status = 'AVAILABLE'
+                    auction.active_player.save()
 
             player.status = 'BIDDING'
             player.save()
@@ -344,6 +345,104 @@ class LiveAuctionEngine:
                 lot_player=player,
                 event_type='PLAYER_SELECTED',
                 details={'method': 'MANUAL_SERIAL_NO', 'serial_no': serial_no}
+            )
+
+        return True, player
+
+    @staticmethod
+    def select_player_by_id(auction, player_id):
+        """
+        Puts a specific player on block by player ID.
+        """
+        player = auction.players.filter(id=player_id, status__in=['AVAILABLE', 'PENDING', 'UNSOLD']).first()
+        if not player:
+            return False, "Player is not available for auction."
+
+        with transaction.atomic():
+            if auction.active_player and auction.active_player.id != player.id:
+                if auction.active_player.status == 'BIDDING':
+                    auction.active_player.status = 'AVAILABLE'
+                    auction.active_player.save()
+
+            player.status = 'BIDDING'
+            player.save()
+
+            auction.active_player = player
+            if auction.status != 'ACTIVE':
+                auction.status = 'ACTIVE'
+            auction.save()
+
+            AuctionEventLog.objects.create(
+                auction=auction,
+                lot_player=player,
+                event_type='PLAYER_SELECTED',
+                details={'method': 'MANUAL_ID', 'player_id': str(player_id)}
+            )
+
+        return True, player
+
+    @staticmethod
+    def select_next_player_by_category(auction, category=None):
+        """
+        Puts the next available player on block, strictly respecting category priority or specific filter.
+        """
+        player = None
+        if category and category.strip() and category.upper() != 'ALL':
+            qs = auction.players.filter(status__in=['AVAILABLE', 'PENDING'], category__iexact=category.strip())
+            player = qs.order_by('serial_no', 'created_at', 'id').first()
+        else:
+            # Respect category priority order configured in Master Setup & Rules
+            cat_names = list(AuctionCategory.objects.filter(auction=auction).order_by('priority', 'display_order', 'created_at').values_list('name', flat=True))
+            for cat_name in cat_names:
+                cat_qs = auction.players.filter(status__in=['AVAILABLE', 'PENDING'], category__iexact=cat_name).order_by('serial_no', 'created_at', 'id')
+                if cat_qs.exists():
+                    player = cat_qs.first()
+                    break
+            if not player:
+                player = auction.players.filter(status__in=['AVAILABLE', 'PENDING']).order_by('serial_no', 'created_at', 'id').first()
+
+        if not player:
+            # Fallback check for UNSOLD if bring_back_unsold is enabled
+            config = getattr(auction, 'v24_config', None)
+            bring_back = config.bring_back_unsold if config else True
+            if bring_back:
+                if category and category.strip() and category.upper() != 'ALL':
+                    unsold_qs = auction.players.filter(status='UNSOLD', category__iexact=category.strip())
+                    player = unsold_qs.order_by('serial_no', 'created_at', 'id').first()
+                else:
+                    cat_names = list(AuctionCategory.objects.filter(auction=auction).order_by('priority', 'display_order', 'created_at').values_list('name', flat=True))
+                    for cat_name in cat_names:
+                        cat_qs = auction.players.filter(status='UNSOLD', category__iexact=cat_name).order_by('serial_no', 'created_at', 'id')
+                        if cat_qs.exists():
+                            player = cat_qs.first()
+                            break
+                    if not player:
+                        player = auction.players.filter(status='UNSOLD').order_by('serial_no', 'created_at', 'id').first()
+
+        if not player:
+            if category and category.strip() and category.upper() != 'ALL':
+                return False, f"No available players found in category '{category}'."
+            return False, "No available players remaining in the auction pool."
+
+        with transaction.atomic():
+            if auction.active_player and auction.active_player.id != player.id:
+                if auction.active_player.status == 'BIDDING':
+                    auction.active_player.status = 'AVAILABLE'
+                    auction.active_player.save()
+
+            player.status = 'BIDDING'
+            player.save()
+
+            auction.active_player = player
+            if auction.status != 'ACTIVE':
+                auction.status = 'ACTIVE'
+            auction.save()
+
+            AuctionEventLog.objects.create(
+                auction=auction,
+                lot_player=player,
+                event_type='PLAYER_SELECTED',
+                details={'method': 'CATEGORY_SELECT', 'category': category or 'ALL', 'player_id': str(player.id)}
             )
 
         return True, player

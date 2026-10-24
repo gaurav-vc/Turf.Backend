@@ -39,11 +39,14 @@ class AuctionCategory(BaseModel):
     name = models.CharField(max_length=100)
     display_order = models.IntegerField(default=1)
     target_count = models.IntegerField(default=0)
+    min_players = models.IntegerField(default=0)
+    max_players = models.IntegerField(null=True, blank=True)
+    priority = models.IntegerField(default=1)
     base_price = models.DecimalField(max_digits=12, decimal_places=2, default=0.0)
     min_bid = models.DecimalField(max_digits=12, decimal_places=2, default=0.0)
 
     class Meta:
-        ordering = ['display_order', 'created_at']
+        ordering = ['priority', 'display_order', 'created_at']
         unique_together = ('auction', 'name')
 
 class BidSlab(BaseModel):

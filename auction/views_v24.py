@@ -248,10 +248,27 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
         auction = self._get_auction(pk)
 
         serial_no = request.data.get('serial_no')
-        if not serial_no:
-            return Response({'error': 'serial_no is required'}, status=status.HTTP_400_BAD_REQUEST)
+        player_id = request.data.get('player_id')
+        if not serial_no and not player_id:
+            return Response({'error': 'serial_no or player_id is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-        ok, result = LiveAuctionEngine.select_player_by_number(auction, int(serial_no))
+        if serial_no is not None and str(serial_no).strip():
+            ok, result = LiveAuctionEngine.select_player_by_number(auction, int(serial_no))
+        else:
+            ok, result = LiveAuctionEngine.select_player_by_id(auction, player_id)
+        if not ok:
+            return Response({'error': result}, status=status.HTTP_400_BAD_REQUEST)
+
+        state = LiveAuctionEngine.get_live_state(auction)
+        return Response({'success': True, 'state': state})
+
+    @action(detail=True, methods=['post'], url_path='select_next_player')
+    def select_next_player(self, request, pk=None):
+        """Puts the next available player of the given category on the auction block."""
+        auction = self._get_auction(pk)
+        category = request.data.get('category')
+
+        ok, result = LiveAuctionEngine.select_next_player_by_category(auction, category)
         if not ok:
             return Response({'error': result}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -1461,17 +1478,24 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
     def _generate_pure_cards_pdf(self, auction_name, players, cols=3, rows=5, pdf_format='category', pdf_settings=None):
         from collections import defaultdict
         width, height = 595.28, 841.89  # A4 in points (210mm x 297mm)
-        margin = 18.0
-        header_h = 24.0
+        cfg = pdf_settings or {}
+        cfg_elements = cfg.get('elements', {})
+        branding = cfg.get('branding', {})
+        header_cfg = cfg.get('header', {})
+        footer_cfg = cfg.get('footer', {})
+
+        show_header = header_cfg.get('show', True)
+        header_h = float(header_cfg.get('height', 26.0)) if show_header else 0.0
+
+        show_footer = footer_cfg.get('show', False)
+        footer_h = float(footer_cfg.get('height', 20.0)) if show_footer else 0.0
+
         usable_w = width - (2 * margin)
-        usable_h = height - (2 * margin) - header_h - 10.0
+        usable_h = height - (2 * margin) - header_h - footer_h - 10.0
         card_w = usable_w / max(1, cols)
         card_h = usable_h / max(1, rows)
         page_capacity = cols * rows
 
-        cfg = pdf_settings or {}
-        cfg_elements = cfg.get('elements', {})
-        branding = cfg.get('branding', {})
         show_t_name = branding.get('show_tournament_name', True)
         t_title = branding.get('tournament_title') or auction_name or 'Turf Tournament'
 
@@ -1574,23 +1598,54 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
 
         pages = []
 
-        def build_page_stream(page_players, section_title):
+        def build_page_stream(page_players, section_title, page_num=1, total_pages=1):
             cmds = []
 
             # (A) Page Background Image / Watermark with Opacity
             if bg_info:
                 cmds.append(f"q {width:.2f} 0 0 {height:.2f} 0 0 cm /ImBg Do Q")
 
-            # (B) Sheet Header Banner
-            cmds.append(f"0.96 0.97 0.99 rg {margin:.1f} {height - margin - header_h:.1f} {usable_w:.1f} {header_h:.1f} re f")
-            cmds.append(f"{accent_r:.3f} {accent_g:.3f} {accent_b:.3f} rg {margin:.1f} {height - margin - header_h:.1f} {usable_w:.1f} 2.0 re f")
+            # (B) Sheet Header Banner (Configurable & Adjustable)
+            if show_header:
+                h_bg_r, h_bg_g, h_bg_b = hex_to_rgb(header_cfg.get('bg_colour', '#f8fafc'))
+                h_tx_r, h_tx_g, h_tx_b = hex_to_rgb(header_cfg.get('text_colour', '#0f172a'))
+                cmds.append(f"{h_bg_r:.3f} {h_bg_g:.3f} {h_bg_b:.3f} rg {margin:.1f} {height - margin - header_h:.1f} {usable_w:.1f} {header_h:.1f} re f")
+                cmds.append(f"{accent_r:.3f} {accent_g:.3f} {accent_b:.3f} rg {margin:.1f} {height - margin - header_h:.1f} {usable_w:.1f} 2.0 re f")
 
-            hdr_left = f"{t_title}   |   {section_title}" if show_t_name else section_title
-            cmds.append(f"BT /F2 10.5 Tf 0.08 0.12 0.20 rg {margin + 8:.1f} {height - margin - 16:.1f} Td ({esc(hdr_left)}) Tj ET")
+                hdr_title = header_cfg.get('title') or (f"{t_title}   |   {section_title}" if show_t_name else section_title)
+                h_font_sz = float(header_cfg.get('font_size', 10.5))
+                hdr_y = height - margin - (header_h / 2.0) - (h_font_sz * 0.35)
+                cmds.append(f"BT /F2 {h_font_sz:.1f} Tf {h_tx_r:.3f} {h_tx_g:.3f} {h_tx_b:.3f} rg {margin + 8:.1f} {hdr_y:.1f} Td ({esc(hdr_title)}) Tj ET")
 
-            hdr_right = "Every category on new page" if pdf_format == 'category' else "Continuous order"
-            right_x = margin + usable_w - (len(hdr_right) * 5.2) - 8
-            cmds.append(f"BT /F1 8.5 Tf 0.40 0.45 0.55 rg {right_x:.1f} {height - margin - 15:.1f} Td ({esc(hdr_right)}) Tj ET")
+                hdr_right = header_cfg.get('right_text') or ("Every category on new page" if pdf_format == 'category' else "Continuous order")
+                if hdr_right:
+                    right_x = margin + usable_w - (len(hdr_right) * 5.2) - 8
+                    cmds.append(f"BT /F1 8.5 Tf 0.40 0.45 0.55 rg {right_x:.1f} {hdr_y:.1f} Td ({esc(hdr_right)}) Tj ET")
+
+            # (C) Sheet Footer Banner (Configurable & Adjustable)
+            if show_footer:
+                f_bg_r, f_bg_g, f_bg_b = hex_to_rgb(footer_cfg.get('bg_colour', '#f8fafc'))
+                f_tx_r, f_tx_g, f_tx_b = hex_to_rgb(footer_cfg.get('text_colour', '#64748b'))
+                f_y = margin
+                cmds.append(f"{f_bg_r:.3f} {f_bg_g:.3f} {f_bg_b:.3f} rg {margin:.1f} {f_y:.1f} {usable_w:.1f} {footer_h:.1f} re f")
+                cmds.append(f"{accent_r:.3f} {accent_g:.3f} {accent_b:.3f} rg {margin:.1f} {f_y + footer_h - 1.0:.1f} {usable_w:.1f} 1.0 re f")
+
+                f_sz = float(footer_cfg.get('font_size', 8.5))
+                f_ty = f_y + (footer_h / 2.0) - (f_sz * 0.35)
+
+                f_left = footer_cfg.get('left_text', '')
+                if f_left:
+                    cmds.append(f"BT /F1 {f_sz:.1f} Tf {f_tx_r:.3f} {f_tx_g:.3f} {f_tx_b:.3f} rg {margin + 8:.1f} {f_ty:.1f} Td ({esc(f_left)}) Tj ET")
+
+                f_center = (footer_cfg.get('center_text') or '').replace('{page}', str(page_num)).replace('{totalPages}', str(total_pages))
+                if f_center:
+                    c_x = margin + (usable_w / 2.0) - (len(f_center) * f_sz * 0.25)
+                    cmds.append(f"BT /F1 {f_sz:.1f} Tf {f_tx_r:.3f} {f_tx_g:.3f} {f_tx_b:.3f} rg {c_x:.1f} {f_ty:.1f} Td ({esc(f_center)}) Tj ET")
+
+                f_right = footer_cfg.get('right_text', '')
+                if f_right:
+                    r_x = margin + usable_w - (len(f_right) * f_sz * 0.52) - 8
+                    cmds.append(f"BT /F1 {f_sz:.1f} Tf {f_tx_r:.3f} {f_tx_g:.3f} {f_tx_b:.3f} rg {r_x:.1f} {f_ty:.1f} Td ({esc(f_right)}) Tj ET")
 
             # (C) Render Draggable Logos
             for l_entry in prepared_logos:
@@ -1620,8 +1675,12 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                     ch = card_h - 5.0
                     card_top = cy + ch
 
-                    # Card fill & border
-                    cmds.append(f"{fill_r:.3f} {fill_g:.3f} {fill_b:.3f} rg {accent_r:.3f} {accent_g:.3f} {accent_b:.3f} RG 0.8 w {cx:.1f} {cy:.1f} {cw:.1f} {ch:.1f} re B")
+                    # Card fill & border with opacity support
+                    card_opacity_val = float(cfg.get('card_fill_opacity', 95))
+                    if card_opacity_val <= 5.0:
+                        cmds.append(f"{accent_r:.3f} {accent_g:.3f} {accent_b:.3f} RG 0.8 w {cx:.1f} {cy:.1f} {cw:.1f} {ch:.1f} re S")
+                    else:
+                        cmds.append(f"{fill_r:.3f} {fill_g:.3f} {fill_b:.3f} rg {accent_r:.3f} {accent_g:.3f} {accent_b:.3f} RG 0.8 w {cx:.1f} {cy:.1f} {cw:.1f} {ch:.1f} re B")
                     
                     # Top accent bar
                     cmds.append(f"{accent_r:.3f} {accent_g:.3f} {accent_b:.3f} rg {cx:.1f} {card_top - 3.5:.1f} {cw:.1f} 3.5 re f")
@@ -1640,18 +1699,43 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                     exp = getattr(p, 'experience', '') or cdata.get('experience') or ''
                     app_id = cdata.get('application_id') or str(getattr(p, 'id', ''))[:8]
 
+                    # Combine default layout keys with any custom keys defined in cfg_elements
+                    all_keys = list(layout_defaults.keys())
+                    for k in cfg_elements.keys():
+                        if k not in all_keys:
+                            all_keys.append(k)
+
+                    # Global element box opacity if set
+                    global_box_op = float(cfg.get('element_box_opacity', 0))
+
                     # Render each element by relative % position to prevent any overlaps
-                    for el_key, def_cfg in layout_defaults.items():
+                    for el_key in all_keys:
+                        def_cfg = layout_defaults.get(el_key, {
+                            'selected': True, 'x': 38, 'y': 80, 'w': 40, 'h': 10,
+                            'font_size': 9, 'colour': '#0f172a', 'bold': False, 'show_label': True
+                        })
                         cfg_el = cfg_elements.get(el_key, {})
                         el = {**def_cfg, **cfg_el}
                         if not el.get('selected', True):
                             continue
 
-                        el_x = cx + (float(el['x']) / 100.0) * cw
-                        el_w = (float(el['w']) / 100.0) * cw
-                        el_h = (float(el['h']) / 100.0) * ch
-                        el_y_top = card_top - (float(el['y']) / 100.0) * ch
+                        el_x = cx + (float(el.get('x', 0)) / 100.0) * cw
+                        el_w = (float(el.get('w', 20)) / 100.0) * cw
+                        el_h = (float(el.get('h', 10)) / 100.0) * ch
+                        el_y_top = card_top - (float(el.get('y', 0)) / 100.0) * ch
                         el_y_bottom = el_y_top - el_h
+
+                        # Draw box background pill if box opacity is enabled
+                        el_box_op = float(el.get('bg_opacity') if el.get('bg_opacity') is not None else global_box_op)
+                        if el_box_op > 0 and el_key != 'player_photo' and el_key != 'base_price':
+                            box_bg_r, box_bg_g, box_bg_b = hex_to_rgb(el.get('bg_colour', '#FFFFFF'))
+                            cmds.append(f"{box_bg_r:.3f} {box_bg_g:.3f} {box_bg_b:.3f} rg 0.85 0.88 0.92 RG 0.4 w {el_x:.1f} {el_y_bottom:.1f} {el_w:.1f} {el_h:.1f} re B")
+
+                        custom_override = el.get('custom_text')
+                        custom_lbl = el.get('label')
+                        c_r, c_g, c_b = hex_to_rgb(el.get('colour', '#0f172a'))
+                        f_sz = max(6.0, min(14.0, float(el.get('font_size', 9.5)) * 0.72))
+                        font_choice = '/F2' if el.get('bold', False) else '/F1'
 
                         if el_key == 'player_photo':
                             cmds.append(f"0.93 0.95 0.97 rg 0.78 0.82 0.88 RG 0.5 w {el_x:.1f} {el_y_bottom:.1f} {el_w:.1f} {el_h:.1f} re B")
@@ -1660,69 +1744,76 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                             cmds.append(f"BT /F2 8.5 Tf 0.45 0.50 0.60 rg {ph_tx:.1f} {ph_ty:.1f} Td (PHOTO) Tj ET")
 
                         elif el_key == 'player_number':
-                            lbl = 'No: ' if el.get('show_label', False) else '#'
-                            val_text = f"{lbl}{serial}"
+                            lbl = (custom_lbl + ' ') if custom_lbl else ('No: ' if el.get('show_label', False) else '#')
+                            val_text = f"{lbl}{serial}" if custom_override is None else f"{lbl}{custom_override}"
                             f_sz = max(8.0, min(12.0, float(el.get('font_size', 13)) * 0.75))
                             ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
-                            c_r, c_g, c_b = hex_to_rgb(el.get('colour', '#0284c7'))
                             cmds.append(f"BT /F2 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)}) Tj ET")
 
                         elif el_key == 'category':
-                            lbl = 'Cat: ' if el.get('show_label', False) else ''
-                            val_text = f"[{lbl}{cat}]"
+                            lbl = (custom_lbl + ' ') if custom_lbl else ('Cat: ' if el.get('show_label', False) else '')
+                            val_text = f"[{lbl}{cat}]" if custom_override is None else f"[{lbl}{custom_override}]"
                             f_sz = max(7.0, min(10.0, float(el.get('font_size', 10)) * 0.72))
                             ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
-                            c_r, c_g, c_b = hex_to_rgb(el.get('colour', '#7c3aed'))
                             text_len_est = len(val_text) * f_sz * 0.52
                             tx = max(el_x, el_x + el_w - text_len_est) if el.get('align') == 'right' else el_x
                             cmds.append(f"BT /F2 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {tx:.1f} {ty:.1f} Td ({esc(val_text)}) Tj ET")
 
                         elif el_key == 'name':
-                            lbl = 'Name: ' if el.get('show_label', False) else ''
-                            val_text = f"{lbl}{name}"
+                            lbl = (custom_lbl + ' ') if custom_lbl else ('Name: ' if el.get('show_label', False) else '')
+                            val_text = f"{lbl}{name}" if custom_override is None else f"{lbl}{custom_override}"
                             f_sz = max(9.0, min(13.0, float(el.get('font_size', 13)) * 0.75))
                             ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
-                            c_r, c_g, c_b = hex_to_rgb(el.get('colour', '#0f172a'))
-                            cmds.append(f"BT /F2 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)[:24]}) Tj ET")
+                            cmds.append(f"BT /F2 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)[:28]}) Tj ET")
 
                         elif el_key == 'role':
-                            lbl = 'Role: ' if el.get('show_label', False) else ''
-                            val_text = f"{lbl}{role}"
+                            lbl = (custom_lbl + ' ') if custom_lbl else ('Role: ' if el.get('show_label', False) else '')
+                            val_text = f"{lbl}{role}" if custom_override is None else f"{lbl}{custom_override}"
                             f_sz = max(7.0, min(9.5, float(el.get('font_size', 9.5)) * 0.72))
                             ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
-                            c_r, c_g, c_b = hex_to_rgb(el.get('colour', '#334155'))
-                            cmds.append(f"BT /F1 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)[:26]}) Tj ET")
+                            cmds.append(f"BT /F1 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)[:28]}) Tj ET")
 
                         elif el_key == 'base_price':
-                            lbl = 'Base Price: ' if el.get('show_label', True) else 'Base: '
-                            val_text = f"{lbl}Rs. {int(price):,}"
+                            lbl = (custom_lbl + ' ') if custom_lbl else ('Base Price: ' if el.get('show_label', True) else 'Base: ')
+                            val_text = f"{lbl}Rs. {int(price):,}" if custom_override is None else f"{lbl}{custom_override}"
                             pill_h = el_h - 1.5
                             pill_y = el_y_bottom + 0.75
-                            cmds.append(f"0.92 0.98 0.94 rg 0.70 0.88 0.75 RG 0.5 w {el_x:.1f} {pill_y:.1f} {el_w:.1f} {pill_h:.1f} re B")
+                            if el.get('bg_opacity') != 0:
+                                bg_hex = el.get('bg_colour')
+                                if bg_hex and bg_hex != '#ffffff':
+                                    b_r, b_g, b_b = hex_to_rgb(bg_hex)
+                                    cmds.append(f"{b_r:.3f} {b_g:.3f} {b_b:.3f} rg 0.70 0.88 0.75 RG 0.5 w {el_x:.1f} {pill_y:.1f} {el_w:.1f} {pill_h:.1f} re B")
+                                else:
+                                    cmds.append(f"0.92 0.98 0.94 rg 0.70 0.88 0.75 RG 0.5 w {el_x:.1f} {pill_y:.1f} {el_w:.1f} {pill_h:.1f} re B")
                             f_sz = max(7.0, min(10.5, float(el.get('font_size', 10.5)) * 0.75))
                             ty = pill_y + (pill_h / 2.0) - (f_sz * 0.35)
                             cmds.append(f"BT /F2 {f_sz:.1f} Tf 0.086 0.639 0.290 rg {el_x + 3.0:.1f} {ty:.1f} Td ({esc(val_text)}) Tj ET")
 
                         else:
-                            # 2-column detail specs
-                            val_raw = ''
-                            default_lbl = ''
-                            if el_key == 'location': val_raw = loc; default_lbl = 'Loc: '
-                            elif el_key == 'batting': val_raw = bat; default_lbl = 'Bat: '
-                            elif el_key == 'bowling': val_raw = bowl; default_lbl = 'Bowl: '
-                            elif el_key == 'mobile': val_raw = mob; default_lbl = 'Mob: '
-                            elif el_key == 'age': val_raw = str(age); default_lbl = 'Age: '
-                            elif el_key == 'experience': val_raw = str(exp); default_lbl = 'Exp: '
-                            elif el_key == 'application_id': val_raw = str(app_id); default_lbl = 'ID: '
+                            # Standard detail field or custom box
+                            val_raw = custom_override if custom_override is not None else ''
+                            default_lbl = custom_lbl if custom_lbl is not None else ''
+                            if not val_raw and custom_override is None:
+                                if el_key == 'location': val_raw = loc; default_lbl = default_lbl or 'Loc: '
+                                elif el_key == 'batting': val_raw = bat; default_lbl = default_lbl or 'Bat: '
+                                elif el_key == 'bowling': val_raw = bowl; default_lbl = default_lbl or 'Bowl: '
+                                elif el_key == 'mobile': val_raw = mob; default_lbl = default_lbl or 'Mob: '
+                                elif el_key == 'age': val_raw = str(age); default_lbl = default_lbl or 'Age: '
+                                elif el_key == 'experience': val_raw = str(exp); default_lbl = default_lbl or 'Exp: '
+                                elif el_key == 'application_id': val_raw = str(app_id); default_lbl = default_lbl or 'ID: '
+                                else:
+                                    val_raw = el.get('label') or el_key.replace('_', ' ').title()
 
-                            if val_raw:
-                                lbl = default_lbl if el.get('show_label', True) else ''
-                                val_text = f"{lbl}{val_raw}"
-                                f_sz = max(6.0, min(8.5, float(el.get('font_size', 8.5)) * 0.70))
-                                ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
-                                c_r, c_g, c_b = hex_to_rgb(el.get('colour', '#64748b'))
-                                font_choice = '/F2' if el.get('bold', False) else '/F1'
-                                cmds.append(f"BT {font_choice} {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)[:18]}) Tj ET")
+                            lbl = default_lbl if el.get('show_label', True) else ''
+                            val_text = f"{lbl}{val_raw}" if not val_raw.startswith(lbl) else val_raw
+                            ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
+                            align = el.get('align', 'left')
+                            tx = el_x
+                            if align == 'right':
+                                tx = max(el_x, el_x + el_w - (len(val_text) * f_sz * 0.52))
+                            elif align == 'center':
+                                tx = max(el_x, el_x + (el_w / 2.0) - (len(val_text) * f_sz * 0.26))
+                            cmds.append(f"BT {font_choice} {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {tx:.1f} {ty:.1f} Td ({esc(val_text)[:32]}) Tj ET")
 
             return "\n".join(cmds)
 
@@ -1733,17 +1824,27 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 cat_name = getattr(p, 'tier', None) or getattr(p, 'category', None) or 'General Category'
                 cat_groups[cat_name].append(p)
 
+            total_pages = 0
+            for c_players in cat_groups.values():
+                total_pages += (len(c_players) + page_capacity - 1) // max(1, page_capacity)
+            total_pages = max(1, total_pages)
+
+            curr_page = 1
             for cat_name, c_players in cat_groups.items():
                 for p_idx in range(0, len(c_players), page_capacity):
                     p_slice = c_players[p_idx:p_idx + page_capacity]
                     page_label = f"Category: {cat_name} ({len(c_players)} Players)"
-                    pages.append(build_page_stream(p_slice, page_label))
+                    pages.append(build_page_stream(p_slice, page_label, curr_page, total_pages))
+                    curr_page += 1
         else:
             # Auction Format: Continuous sequential lot order
+            total_pages = max(1, (len(players) + page_capacity - 1) // max(1, page_capacity))
+            curr_page = 1
             for p_idx in range(0, len(players), page_capacity):
                 p_slice = players[p_idx:p_idx + page_capacity]
                 page_label = f"Auction Format (Lots {p_idx + 1} - {min(len(players), p_idx + page_capacity)} of {len(players)})"
-                pages.append(build_page_stream(p_slice, page_label))
+                pages.append(build_page_stream(p_slice, page_label, curr_page, total_pages))
+                curr_page += 1
 
         return self._assemble_raw_pdf(pages, width, height, images_dict)
 
@@ -2554,12 +2655,18 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                     incoming_names.append(name.lower())
                     base = Decimal(str(c_item.get('base_price', 0) or 0))
                     target = int(c_item.get('target_count', 0) or 0)
+                    min_p = int(c_item.get('min_players', 0) or 0)
+                    max_p = int(c_item.get('max_players')) if c_item.get('max_players') not in [None, ''] else None
+                    prio = int(c_item.get('priority', idx) or idx)
                     cat_obj = auction.categories.filter(name__iexact=name).first()
                     if cat_obj:
                         cat_obj.name = name
                         cat_obj.base_price = base
                         cat_obj.min_bid = base
                         cat_obj.target_count = target
+                        cat_obj.min_players = min_p
+                        cat_obj.max_players = max_p
+                        cat_obj.priority = prio
                         cat_obj.display_order = idx
                         cat_obj.save()
                     else:
@@ -2569,6 +2676,9 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                             base_price=base,
                             min_bid=base,
                             target_count=target,
+                            min_players=min_p,
+                            max_players=max_p,
+                            priority=prio,
                             display_order=idx
                         )
                 for existing_cat in auction.categories.all():
@@ -2724,8 +2834,8 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             .distinct()
         )
 
-        categories = list(auction.categories.all().order_by('display_order', 'created_at').values(
-            'id', 'name', 'base_price', 'target_count', 'display_order'
+        categories = list(auction.categories.all().order_by('priority', 'display_order', 'created_at').values(
+            'id', 'name', 'base_price', 'target_count', 'display_order', 'min_players', 'max_players', 'priority'
         ))
 
         slabs = list(auction.bid_slabs.all().order_by('up_to_bid').values(
