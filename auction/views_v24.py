@@ -1030,6 +1030,18 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             else:
                 design_json = request.data if isinstance(request.data, dict) else design_obj.design_json
 
+            existing_json = dict(design_obj.design_json or {})
+            if isinstance(design_json, dict):
+                # Safely merge so neither broadcast page design nor pdf design studio clobbers each other
+                if 'pdf_design' in design_json and isinstance(design_json['pdf_design'], dict):
+                    existing_json['pdf_design'] = design_json['pdf_design']
+                if 'pdf_design' in request.data and isinstance(request.data['pdf_design'], dict):
+                    existing_json['pdf_design'] = request.data['pdf_design']
+                for k, v in design_json.items():
+                    if k != 'pdf_design':
+                        existing_json[k] = v
+                design_json = existing_json
+
             # Handle direct file uploads for tournament branding logo or custom background
             if 'tournament_image' in request.FILES:
                 t_file = request.FILES['tournament_image']
@@ -1063,9 +1075,18 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 design_obj.save(update_fields=['design_json'])
             except Exception:
                 design_obj.save()
-            return Response({'success': True, 'design_json': design_obj.design_json})
 
-        return Response(design_obj.design_json or DEFAULT_AUCTION_DESIGN)
+            resp_payload = dict(design_obj.design_json)
+            resp_payload['success'] = True
+            resp_payload['design_json'] = dict(design_obj.design_json)
+            return Response(resp_payload)
+
+        raw_res = design_obj.design_json or DEFAULT_AUCTION_DESIGN
+        if isinstance(raw_res, dict):
+            out_res = dict(raw_res)
+            out_res['design_json'] = dict(raw_res)
+            return Response(out_res)
+        return Response(raw_res)
 
     @action(detail=True, methods=['get', 'post'], permission_classes=[permissions.AllowAny])
     def public_link(self, request, pk=None):
@@ -1385,7 +1406,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             elif 'branding' in request.data or 'elements' in request.data:
                 pdf_settings = request.data
 
-        players = list(auction.players.all().order_by('serial_no')) if auction else []
+        players = list(auction.players.select_related('player').all().order_by('serial_no', 'id')) if auction else []
         if not players:
             class MockP:
                 def __init__(self, s, n, r, c, b, loc='Mumbai', bat='Right Hand', bowl='Right Arm', mob='9876543210', age=28, exp='5 Yrs', app_id='APP-001'):
@@ -1707,9 +1728,16 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                     cmds.append(f"{accent_r:.3f} {accent_g:.3f} {accent_b:.3f} rg {cx:.1f} {card_top - 3.5:.1f} {cw:.1f} 3.5 re f")
 
                     serial = getattr(p, 'serial_no', '—')
-                    name = getattr(p, 'name', None) or (p.player.full_name if getattr(p, 'player', None) else 'Player')
+                    p_user = getattr(p, 'player', None)
+                    name = (
+                        getattr(p, 'name', None) or
+                        (getattr(p_user, 'full_name', None) if p_user else None) or
+                        (getattr(p_user, 'first_name', None) if p_user else None) or
+                        (getattr(p_user, 'username', None) if p_user else None) or
+                        'Player'
+                    )
                     role = getattr(p, 'role', 'Player') or 'Player'
-                    cat = getattr(p, 'tier', None) or getattr(p, 'category', None) or 'General'
+                    cat = getattr(p, 'category', None) or getattr(p, 'tier', None) or 'General'
                     price = getattr(p, 'base_price', 2000) or 2000
                     loc = getattr(p, 'location', '') or ''
                     bat = getattr(p, 'batting_style', '') or ''
@@ -1752,7 +1780,15 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                             box_bg_r, box_bg_g, box_bg_b = hex_to_rgb(el.get('bg_colour', '#FFFFFF'))
                             cmds.append(f"{box_bg_r:.3f} {box_bg_g:.3f} {box_bg_b:.3f} rg 0.85 0.88 0.92 RG 0.4 w {el_x:.1f} {el_y_bottom:.1f} {el_w:.1f} {el_h:.1f} re B")
 
+                        is_custom_box = el.get('is_custom', False)
                         custom_override = el.get('custom_text')
+                        # Ignore legacy/hardcoded template text for standard dynamic fields
+                        if not is_custom_box and custom_override in [
+                            'Virat Kohli', 'Icon', '₹50,000', 'Batsman', 'Mumbai',
+                            'RHB', 'RAF', '9876543210', '28', '5 Yrs', '104', '#1'
+                        ]:
+                            custom_override = None
+
                         custom_lbl = el.get('label')
                         c_r, c_g, c_b = hex_to_rgb(el.get('colour', '#0f172a'))
                         f_sz = max(6.0, min(14.0, float(el.get('font_size', 9.5)) * 0.72))
@@ -1842,7 +1878,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             # Category Wise: Every category starts on a new page!
             cat_groups = defaultdict(list)
             for p in players:
-                cat_name = getattr(p, 'tier', None) or getattr(p, 'category', None) or 'General Category'
+                cat_name = getattr(p, 'category', None) or getattr(p, 'tier', None) or 'General Category'
                 cat_groups[cat_name].append(p)
 
             total_pages = 0
