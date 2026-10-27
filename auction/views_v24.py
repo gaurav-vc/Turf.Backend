@@ -275,6 +275,52 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
         state = LiveAuctionEngine.get_live_state(auction)
         return Response({'success': True, 'state': state})
 
+    @action(detail=True, methods=['get'], permission_classes=[permissions.AllowAny], url_path='player_queue')
+    def player_queue(self, request, pk=None):
+        """Returns the upcoming queue of players for auto-advance or queue preview."""
+        auction = self._get_auction(pk)
+        category = request.query_params.get('category')
+        qs = auction.players.filter(status__in=['AVAILABLE', 'PENDING'])
+        if category and category.strip() and category.upper() != 'ALL':
+            qs = qs.filter(category__iexact=category.strip())
+        
+        # Respect category priority order
+        cat_order = list(AuctionCategory.objects.filter(auction=auction).order_by('priority', 'display_order', 'created_at').values_list('name', flat=True))
+        
+        queued_players = list(qs.order_by('serial_no', 'created_at', 'id')[:10])
+        results = []
+        for p in queued_players:
+            photo = ''
+            if hasattr(p, 'photo_file') and p.photo_file:
+                try:
+                    photo = p.photo_file.url
+                except Exception:
+                    photo = str(p.photo_file)
+            elif hasattr(p, 'photo') and p.photo:
+                photo = str(p.photo)
+            elif p.player and p.player.photo_url:
+                photo = p.player.photo_url
+
+            results.append({
+                'id': str(p.id),
+                'serial_no': p.serial_no,
+                'name': p.player.full_name or 'Player',
+                'category': p.category or 'General',
+                'role': p.role or 'Player',
+                'base_price': float(p.base_price or 0),
+                'photo': photo,
+                'photo_url': photo,
+            })
+
+        config = getattr(auction, 'v24_config', None)
+        return Response({
+            'success': True,
+            'queue': results,
+            'total_pending': qs.count(),
+            'auto_advance_queue': getattr(config, 'auto_advance_queue', True) if config else True,
+            'allow_multiple_bids': getattr(config, 'allow_multiple_bids', False) if config else False,
+        })
+
     @action(detail=True, methods=['post'], url_path='update_player_outcome')
     def update_player_outcome(self, request, pk=None):
         """Host / Organizer manual update of a player's auction status, assigned team, and sold bid amount."""
@@ -1141,7 +1187,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
 
         return Response(PlayerRegistrationLinkSerializer(reg_link).data)
 
-    @action(detail=True, methods=['get', 'post'])
+    @action(detail=True, methods=['get', 'post'], permission_classes=[permissions.AllowAny])
     def group_draw(self, request, pk=None):
         """Group draw stage: generates blind cards, assigns, or reveals cards."""
         auction = self._get_auction(pk)
@@ -1173,7 +1219,14 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 card = auction.group_cards.filter(card_number=card_number).first()
                 if card:
                     if team_id:
-                        team = auction.teams.filter(id=team_id).first()
+                        team = None
+                        try:
+                            team_uuid = uuid.UUID(str(team_id))
+                            team = auction.teams.filter(id=team_uuid).first()
+                        except (ValueError, TypeError, Exception):
+                            team = auction.teams.filter(id=team_id).first()
+                        if not team:
+                            team = auction.teams.filter(team__name__iexact=str(team_id)).first()
                         if team:
                             card.team = team
                             card.save()
@@ -2070,14 +2123,306 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             doc.build(story)
             out.seek(0)
             response = HttpResponse(out.getvalue(), content_type='application/pdf')
-            response['Content-Disposition'] = f'attachment; filename="{auction_name}_Squad_Report.pdf"'
+            response['Content-Disposition'] = f'attachment; filename="{auction_name}_Teams_Report.pdf"'
             return response
         except (ImportError, Exception):
             from django.http import HttpResponse
             pdf_bytes = self._generate_pure_teams_pdf(auction_name, teams, auction)
             response = HttpResponse(pdf_bytes, content_type='application/pdf')
-            response['Content-Disposition'] = f'attachment; filename="{auction_name}_Squad_Report.pdf"'
+            response['Content-Disposition'] = f'attachment; filename="{auction_name}_Teams_Report.pdf"'
             return response
+
+    @action(detail=True, methods=['get', 'post'], permission_classes=[permissions.AllowAny])
+    def export_category_pdf(self, request, pk=None):
+        auction = self._get_auction(pk)
+        auction_name = auction.name if auction else 'Auction'
+
+        players = list(auction.players.select_related('player', 'sold_to', 'sold_to__team').all().order_by('category', 'serial_no', 'id')) if auction else []
+        categories = list(auction.categories.all().order_by('priority', 'display_order')) if auction else []
+        cat_names = [c.name for c in categories]
+
+        try:
+            import io
+            from reportlab.lib import colors
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.units import mm
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from django.http import HttpResponse
+
+            out = io.BytesIO()
+            doc = SimpleDocTemplate(
+                out,
+                pagesize=A4,
+                leftMargin=12*mm,
+                rightMargin=12*mm,
+                topMargin=12*mm,
+                bottomMargin=12*mm,
+                title=f"{auction_name} - Category Wise Players"
+            )
+            styles = getSampleStyleSheet()
+            head_style = ParagraphStyle('CatHead', fontName='Helvetica-Bold', fontSize=15, leading=18, textColor=colors.HexColor('#0B1B35'))
+            cat_title_style = ParagraphStyle('CatTitle', fontName='Helvetica-Bold', fontSize=12, leading=15, textColor=colors.HexColor('#4338CA'))
+            body_style = ParagraphStyle('CatBody', fontName='Helvetica', fontSize=8.5, leading=11, textColor=colors.HexColor('#1E293B'))
+            th_style = ParagraphStyle('CatTh', fontName='Helvetica-Bold', fontSize=8.5, leading=11, textColor=colors.HexColor('#0F172A'))
+
+            story = [
+                Paragraph(f"{auction_name} — Category-Wise Player Roster", head_style),
+                Spacer(1, 4*mm)
+            ]
+
+            # Group players by category
+            grouped = {}
+            for p in players:
+                cat = p.category or 'General'
+                grouped.setdefault(cat, []).append(p)
+
+            # Ensure all configured categories appear
+            ordered_cats = [c for c in cat_names if c in grouped] + [c for c in grouped if c not in cat_names]
+            if not ordered_cats:
+                ordered_cats = list(grouped.keys())
+
+            for idx, c_name in enumerate(ordered_cats):
+                cat_players = grouped.get(c_name, [])
+                story.append(Paragraph(f"Category: {c_name} ({len(cat_players)} Players)", cat_title_style))
+                story.append(Spacer(1, 2*mm))
+
+                data = [[
+                    Paragraph('No.', th_style),
+                    Paragraph('Player Name', th_style),
+                    Paragraph('Role', th_style),
+                    Paragraph('Base Price', th_style),
+                    Paragraph('Status', th_style),
+                    Paragraph('Sold Team / Price', th_style)
+                ]]
+
+                for p in cat_players:
+                    p_name = p.player.full_name or p.player.first_name if p.player else 'Player'
+                    sold_info = '—'
+                    if p.status == 'SOLD':
+                        tm_name = p.sold_to.team.name if p.sold_to and p.sold_to.team else 'Assigned Team'
+                        sold_info = f"{tm_name} (₹{int(p.sold_price or 0):,})"
+                    elif p.status == 'UNSOLD':
+                        sold_info = 'Unsold'
+
+                    data.append([
+                        Paragraph(str(p.serial_no or '—'), body_style),
+                        Paragraph(str(p_name), body_style),
+                        Paragraph(str(p.role or '—'), body_style),
+                        Paragraph(f"₹{int(p.base_price or 0):,}", body_style),
+                        Paragraph(str(p.status), body_style),
+                        Paragraph(str(sold_info), body_style)
+                    ])
+
+                if len(data) == 1:
+                    data.append([Paragraph('—', body_style), Paragraph('No players in this category', body_style), Paragraph('—', body_style), Paragraph('—', body_style), Paragraph('—', body_style), Paragraph('—', body_style)])
+
+                tbl = Table(data, colWidths=[15*mm, 50*mm, 32*mm, 25*mm, 22*mm, 42*mm], repeatRows=1)
+                tbl.setStyle(TableStyle([
+                    ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#EEF2FF')),
+                    ('TEXTCOLOR', (0,0), (-1,0), colors.HexColor('#312E81')),
+                    ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E1')),
+                    ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+                    ('TOPPADDING', (0,0), (-1,-1), 3.5),
+                    ('BOTTOMPADDING', (0,0), (-1,-1), 3.5),
+                ]))
+                story.extend([tbl, Spacer(1, 6*mm)])
+                if idx < len(ordered_cats) - 1:
+                    story.append(PageBreak())
+
+            doc.build(story)
+            out.seek(0)
+            response = HttpResponse(out.getvalue(), content_type='application/pdf')
+            response['Content-Disposition'] = f'attachment; filename="{auction_name}_Category_Report.pdf"'
+            return response
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=True, methods=['get', 'post'], permission_classes=[permissions.AllowAny])
+    def export_booklet_pdf(self, request, pk=None):
+        """
+        Merge and download complete multi-page tournament booklet:
+        Page 1: Cover Page (Title, Logo, Total Teams & Players, Venue, Date)
+        Page 2: Franchise Owners & Purse Kitty Summary
+        Page 3+: Full Team Squad Breakdowns
+        Page N+: Category-Wise Player Pool
+        """
+        auction = self._get_auction(pk)
+        auction_name = auction.name if auction else 'Auction'
+        config, _ = AuctionTournamentConfig.objects.get_or_create(auction=auction) if auction else (None, None)
+
+        teams = list(auction.teams.select_related('team', 'team__user').all()) if auction else []
+        players = list(auction.players.select_related('player', 'sold_to', 'sold_to__team').all().order_by('serial_no', 'id')) if auction else []
+
+        try:
+            import io
+            from reportlab.lib import colors
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.units import mm
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Image as RLImage
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from django.http import HttpResponse
+
+            out = io.BytesIO()
+            doc = SimpleDocTemplate(
+                out,
+                pagesize=A4,
+                leftMargin=14*mm,
+                rightMargin=14*mm,
+                topMargin=14*mm,
+                bottomMargin=14*mm,
+                title=f"{auction_name} - Official Tournament Booklet"
+            )
+            styles = getSampleStyleSheet()
+
+            cover_title_style = ParagraphStyle('CoverTitle', fontName='Helvetica-Bold', fontSize=26, leading=30, alignment=1, textColor=colors.HexColor('#0F172A'))
+            cover_sub_style = ParagraphStyle('CoverSub', fontName='Helvetica-Bold', fontSize=14, leading=18, alignment=1, textColor=colors.HexColor('#4F46E5'))
+            cover_body_style = ParagraphStyle('CoverBody', fontName='Helvetica', fontSize=11, leading=16, alignment=1, textColor=colors.HexColor('#475569'))
+            section_head_style = ParagraphStyle('SectionHead', fontName='Helvetica-Bold', fontSize=16, leading=20, textColor=colors.HexColor('#0F172A'))
+            th_style = ParagraphStyle('BookletTh', fontName='Helvetica-Bold', fontSize=8.5, leading=11, textColor=colors.HexColor('#0F172A'))
+            body_style = ParagraphStyle('BookletBody', fontName='Helvetica', fontSize=8.5, leading=11, textColor=colors.HexColor('#1E293B'))
+
+            story = []
+
+            # ---------------- PAGE 1: COVER PAGE ----------------
+            story.append(Spacer(1, 20*mm))
+            # Tournament Logo if available locally
+            if config and config.tournament_logo:
+                try:
+                    logo_rel = config.tournament_logo.replace(settings.MEDIA_URL, '').lstrip('/')
+                    logo_full = os.path.join(settings.MEDIA_ROOT, logo_rel)
+                    if os.path.exists(logo_full):
+                        story.append(RLImage(logo_full, width=45*mm, height=45*mm))
+                        story.append(Spacer(1, 8*mm))
+                except Exception:
+                    pass
+
+            story.append(Paragraph(str(auction_name), cover_title_style))
+            story.append(Spacer(1, 4*mm))
+            story.append(Paragraph("OFFICIAL TOURNAMENT AUCTION BOOKLET", cover_sub_style))
+            story.append(Spacer(1, 10*mm))
+
+            # Tournament High-Level Stats Box
+            stats_data = [
+                [
+                    Paragraph('<b>Franchise Teams</b>', th_style),
+                    Paragraph(str(len(teams)), cover_sub_style),
+                    Paragraph('<b>Registered Players</b>', th_style),
+                    Paragraph(str(len(players)), cover_sub_style)
+                ],
+                [
+                    Paragraph('<b>Base Team Purse</b>', th_style),
+                    Paragraph(f"₹{int(auction.base_budget):,}" if auction else "—", cover_sub_style),
+                    Paragraph('<b>Squad Limit</b>', th_style),
+                    Paragraph(f"{config.max_squad if config else 11} Players", cover_sub_style)
+                ]
+            ]
+            stats_tbl = Table(stats_data, colWidths=[38*mm, 45*mm, 42*mm, 45*mm])
+            stats_tbl.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#F8FAFC')),
+                ('GRID', (0,0), (-1,-1), 1, colors.HexColor('#E2E8F0')),
+                ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+                ('TOPPADDING', (0,0), (-1,-1), 8),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+            ]))
+            story.append(stats_tbl)
+            story.append(Spacer(1, 15*mm))
+            story.append(Paragraph("Generated by TurfArena Live Auction Engine", cover_body_style))
+            story.append(PageBreak())
+
+            # ---------------- PAGE 2: FRANCHISE OWNERS & PURSES ----------------
+            story.append(Paragraph("Franchise Owners & Financial Summary", section_head_style))
+            story.append(Spacer(1, 4*mm))
+
+            owners_data = [[
+                Paragraph('#', th_style),
+                Paragraph('Team Name', th_style),
+                Paragraph('Owner / Captain', th_style),
+                Paragraph('Starting Purse', th_style),
+                Paragraph('Purse Remaining', th_style),
+                Paragraph('Players Bought', th_style)
+            ]]
+
+            for idx, tm in enumerate(teams, 1):
+                t_name = tm.team.name if tm.team else 'Team'
+                owner_name = tm.team.user.full_name or tm.team.user.first_name if tm.team and tm.team.user else 'Owner'
+                init_purse = auction.base_budget if auction else 50000
+                rem_purse = tm.remaining_budget
+                bought_count = auction.players.filter(sold_to=tm, status='SOLD').count() if auction else 0
+
+                owners_data.append([
+                    Paragraph(str(idx), body_style),
+                    Paragraph(str(t_name), body_style),
+                    Paragraph(str(owner_name), body_style),
+                    Paragraph(f"₹{int(init_purse):,}", body_style),
+                    Paragraph(f"₹{int(rem_purse):,}", body_style),
+                    Paragraph(str(bought_count), body_style)
+                ])
+
+            if len(owners_data) == 1:
+                owners_data.append([Paragraph('—', body_style), Paragraph('No teams configured', body_style), Paragraph('—', body_style), Paragraph('—', body_style), Paragraph('—', body_style), Paragraph('—', body_style)])
+
+            owners_tbl = Table(owners_data, colWidths=[12*mm, 45*mm, 45*mm, 28*mm, 28*mm, 22*mm], repeatRows=1)
+            owners_tbl.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#EEF2FF')),
+                ('TEXTCOLOR', (0,0), (-1,0), colors.HexColor('#312E81')),
+                ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E1')),
+                ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+                ('TOPPADDING', (0,0), (-1,-1), 4),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+            ]))
+            story.append(owners_tbl)
+            story.append(PageBreak())
+
+            # ---------------- PAGE 3+: SQUADS BREAKDOWN ----------------
+            story.append(Paragraph("Franchise Team Squads", section_head_style))
+            story.append(Spacer(1, 4*mm))
+
+            for t_idx, tm in enumerate(teams):
+                t_name = tm.team.name if tm.team else 'Team'
+                t_short = getattr(tm.team, 'short_name', t_name[:3].upper()) if tm.team else 'TM'
+                sold_players = list(auction.players.filter(sold_to=tm, status='SOLD').order_by('serial_no')) if auction else []
+
+                story.append(Paragraph(f"{t_short} — {t_name} (Remaining: ₹{int(tm.remaining_budget):,})", ParagraphStyle('TmTitle', fontName='Helvetica-Bold', fontSize=12, leading=15, textColor=colors.HexColor('#1E293B'))))
+                story.append(Spacer(1, 2*mm))
+
+                t_data = [[
+                    Paragraph('No.', th_style),
+                    Paragraph('Player Name', th_style),
+                    Paragraph('Role', th_style),
+                    Paragraph('Category', th_style),
+                    Paragraph('Sold Amount', th_style)
+                ]]
+                for p in sold_players:
+                    p_name = p.player.full_name or p.player.first_name if p.player else 'Player'
+                    t_data.append([
+                        Paragraph(str(p.serial_no or '—'), body_style),
+                        Paragraph(str(p_name), body_style),
+                        Paragraph(str(p.role or '—'), body_style),
+                        Paragraph(str(p.category or '—'), body_style),
+                        Paragraph(f"₹{int(p.sold_price or 0):,}", body_style)
+                    ])
+
+                if len(t_data) == 1:
+                    t_data.append([Paragraph('—', body_style), Paragraph('No players bought yet', body_style), Paragraph('—', body_style), Paragraph('—', body_style), Paragraph('—', body_style)])
+
+                squad_tbl = Table(t_data, colWidths=[18*mm, 55*mm, 35*mm, 40*mm, 32*mm], repeatRows=1)
+                squad_tbl.setStyle(TableStyle([
+                    ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#F1F5F9')),
+                    ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E1')),
+                    ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+                    ('TOPPADDING', (0,0), (-1,-1), 3),
+                    ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+                ]))
+                story.extend([squad_tbl, Spacer(1, 6*mm)])
+
+            doc.build(story)
+            out.seek(0)
+            response = HttpResponse(out.getvalue(), content_type='application/pdf')
+            response['Content-Disposition'] = f'attachment; filename="{auction_name}_Complete_Booklet.pdf"'
+            return response
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     def _generate_pure_teams_pdf(self, auction_name, teams, auction):
         width, height = 595.28, 841.89
@@ -2642,6 +2987,10 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 config.bring_back_unsold = str(data.get('bring_back_unsold')).lower() in ['true', '1', 'on']
             if 'confirm_sale' in data:
                 config.confirm_sale = str(data.get('confirm_sale')).lower() in ['true', '1', 'on']
+            if 'allow_multiple_bids' in data:
+                config.allow_multiple_bids = str(data.get('allow_multiple_bids')).lower() in ['true', '1', 'on', 'yes']
+            if 'auto_advance_queue' in data:
+                config.auto_advance_queue = str(data.get('auto_advance_queue')).lower() in ['true', '1', 'on', 'yes']
 
             # 4. SOLD Celebration Animations
             if 'sold_animation' in data:
@@ -2830,13 +3179,15 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 except Exception as e:
                     print("Logo upload error:", e)
 
+            media_prefix = settings.MEDIA_URL if settings.MEDIA_URL.endswith('/') else f"{settings.MEDIA_URL}/"
+
             if 'auction_background_file' in request.FILES:
                 bg_file = request.FILES['auction_background_file']
                 try:
                     ext = os.path.splitext(bg_file.name)[1]
                     safe_name = f"auction_bg_{auction.id}_{int(time.time())}{ext}"
                     saved_path = default_storage.save(f"auction/branding/{safe_name}", bg_file)
-                    config.auction_background = request.build_absolute_uri(settings.MEDIA_URL + saved_path)
+                    config.auction_background = f"{media_prefix}{saved_path}"
                 except Exception as e:
                     print("Auction background file upload error:", e)
             elif data.get('auction_background'):
@@ -2848,7 +3199,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                     ext = os.path.splitext(obg_file.name)[1]
                     safe_name = f"overall_bg_{auction.id}_{int(time.time())}{ext}"
                     saved_path = default_storage.save(f"auction/branding/{safe_name}", obg_file)
-                    config.overall_background = request.build_absolute_uri(settings.MEDIA_URL + saved_path)
+                    config.overall_background = f"{media_prefix}{saved_path}"
                 except Exception as e:
                     print("Overall background file upload error:", e)
             elif data.get('overall_background'):
@@ -2860,7 +3211,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                     ext = os.path.splitext(anim_file.name)[1]
                     safe_name = f"sold_anim_{auction.id}_{int(time.time())}{ext}"
                     saved_path = default_storage.save(f"auction/animations/{safe_name}", anim_file)
-                    extended['sold_animation_custom'] = request.build_absolute_uri(settings.MEDIA_URL + saved_path)
+                    extended['sold_animation_custom'] = f"{media_prefix}{saved_path}"
                 except Exception as e:
                     print("Sold animation upload error:", e)
             elif 'sold_animation_custom_url' in data:
@@ -2872,7 +3223,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                     ext = os.path.splitext(anim_file.name)[1]
                     safe_name = f"highest_anim_{auction.id}_{int(time.time())}{ext}"
                     saved_path = default_storage.save(f"auction/animations/{safe_name}", anim_file)
-                    extended['highest_bid_animation_custom'] = request.build_absolute_uri(settings.MEDIA_URL + saved_path)
+                    extended['highest_bid_animation_custom'] = f"{media_prefix}{saved_path}"
                 except Exception as e:
                     print("Highest bid animation upload error:", e)
             elif 'highest_bid_animation_custom_url' in data:
@@ -2890,7 +3241,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                     ext = os.path.splitext(bg_file.name)[1]
                     safe_name = f"group_card_bg_{auction.id}_{int(time.time())}{ext}"
                     saved_path = default_storage.save(f"auction/branding/{safe_name}", bg_file)
-                    extended['group_card_bg_image'] = request.build_absolute_uri(settings.MEDIA_URL + saved_path)
+                    extended['group_card_bg_image'] = f"{media_prefix}{saved_path}"
                 except Exception as e:
                     print("Group card background upload error:", e)
             elif 'group_card_bg_image' in data:
@@ -2980,6 +3331,8 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 'tournament_logo': config.tournament_logo or '',
                 'auction_background': config.auction_background or 'stadium',
                 'overall_background': config.overall_background or 'default',
+                'allow_multiple_bids': getattr(config, 'allow_multiple_bids', False),
+                'auto_advance_queue': getattr(config, 'auto_advance_queue', True),
                 'online_timer_enabled': config.online_timer_enabled,
                 'timer_seconds': config.timer_seconds or 30,
                 'closing_wait_seconds': config.closing_wait_seconds or 5,
@@ -3001,9 +3354,19 @@ class AuctionCategoryViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs = super().get_queryset()
         auction_id = self.request.query_params.get('auction')
-        if auction_id:
-            qs = qs.filter(auction_id=auction_id)
-        return qs.order_by('display_order', 'id')
+        return _safe_filter_auction(qs, auction_id).order_by('display_order', 'id')
+
+def _safe_filter_auction(qs, auction_id):
+    if not auction_id:
+        return qs
+    try:
+        uuid_obj = uuid.UUID(str(auction_id))
+        return qs.filter(auction_id=uuid_obj)
+    except (ValueError, TypeError):
+        fallback_auc = Auction.objects.first()
+        if fallback_auc:
+            return qs.filter(auction=fallback_auc)
+        return qs.none()
 
 class BidSlabViewSet(viewsets.ModelViewSet):
     queryset = BidSlab.objects.all()
@@ -3013,9 +3376,7 @@ class BidSlabViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs = super().get_queryset()
         auction_id = self.request.query_params.get('auction')
-        if auction_id:
-            qs = qs.filter(auction_id=auction_id)
-        return qs
+        return _safe_filter_auction(qs, auction_id)
 
 class SquadRuleViewSet(viewsets.ModelViewSet):
     queryset = SquadRule.objects.all()
@@ -3025,9 +3386,7 @@ class SquadRuleViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs = super().get_queryset()
         auction_id = self.request.query_params.get('auction')
-        if auction_id:
-            qs = qs.filter(auction_id=auction_id)
-        return qs
+        return _safe_filter_auction(qs, auction_id)
 
 class CustomFieldDefinitionViewSet(viewsets.ModelViewSet):
     queryset = CustomFieldDefinition.objects.all()
@@ -3037,9 +3396,7 @@ class CustomFieldDefinitionViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs = super().get_queryset()
         auction_id = self.request.query_params.get('auction')
-        if auction_id:
-            qs = qs.filter(auction_id=auction_id)
-        return qs
+        return _safe_filter_auction(qs, auction_id)
 
 class AuctionSponsorItemViewSet(viewsets.ModelViewSet):
     queryset = AuctionSponsorItem.objects.all()

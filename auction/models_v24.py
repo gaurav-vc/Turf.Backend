@@ -31,6 +31,8 @@ class AuctionTournamentConfig(BaseModel):
     category_sequence = models.JSONField(default=list, blank=True)
     completion_message = models.CharField(max_length=255, default='Auction Completed - All teams are now completed')
     custom_bid_enabled = models.BooleanField(default=True)
+    allow_multiple_bids = models.BooleanField(default=False)
+    auto_advance_queue = models.BooleanField(default=True)
     live_media_enabled = models.BooleanField(default=False)
     live_media_url = models.CharField(max_length=500, blank=True, null=True)
 

@@ -109,7 +109,10 @@ class LiveAuctionEngine:
         current_highest = player.bids.order_by('-amount').first()
         current_amount = current_highest.amount if current_highest else Decimal('0.00')
 
-        if current_highest and current_highest.team_id == team.id:
+        config = getattr(auction, 'v24_config', None)
+        allow_multiple = getattr(config, 'allow_multiple_bids', False) if config else False
+
+        if not allow_multiple and current_highest and current_highest.team_id == team.id:
             return False, f"{team.team.name} is already the highest bidder."
 
         if amount is not None:

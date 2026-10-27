@@ -205,7 +205,16 @@ class AuctionPlayerViewSet(viewsets.ModelViewSet):
         qs = super().get_queryset()
         auction_id = self.request.query_params.get('auction')
         if auction_id:
-            qs = qs.filter(auction_id=auction_id)
+            try:
+                uuid_obj = uuid.UUID(str(auction_id))
+                qs = qs.filter(auction_id=uuid_obj)
+            except (ValueError, TypeError):
+                # If non-UUID fallback like '1' is passed, resolve to the first available auction
+                fallback_auc = Auction.objects.first()
+                if fallback_auc:
+                    qs = qs.filter(auction=fallback_auc)
+                else:
+                    qs = qs.none()
         category = self.request.query_params.get('category')
         if category and category.strip() and category.upper() != 'ALL':
             qs = qs.filter(category__iexact=category.strip())
@@ -223,6 +232,25 @@ class AuctionPlayerViewSet(viewsets.ModelViewSet):
             instance.player.first_name = str(name).strip()
             instance.player.save(update_fields=['full_name', 'first_name'])
 
+        # Unique sequence number enforcement:
+        # If user sets or edits serial_no, look for existing player with same sequence no and clear theirs to blank
+        if 'serial_no' in data:
+            raw_s = data.get('serial_no')
+            if raw_s is None or str(raw_s).strip() in ['', 'null', 'undefined', 'None']:
+                instance.serial_no = None
+                instance.save(update_fields=['serial_no'])
+            else:
+                try:
+                    s_int = int(raw_s)
+                    AuctionPlayer.objects.filter(
+                        auction=instance.auction,
+                        serial_no=s_int
+                    ).exclude(id=instance.id).update(serial_no=None)
+                    instance.serial_no = s_int
+                    instance.save(update_fields=['serial_no'])
+                except (ValueError, TypeError):
+                    pass
+
         if 'photo_file' in request.FILES:
             from django.core.files.storage import default_storage
             from django.conf import settings
@@ -231,7 +259,8 @@ class AuctionPlayerViewSet(viewsets.ModelViewSet):
             ext = os.path.splitext(p_file.name)[1]
             safe_name = f"player_{instance.id}_{int(time.time())}_{secrets.token_hex(4)}{ext}"
             saved_path = default_storage.save(f"auction_players/{safe_name}", p_file)
-            instance.photo_url = request.build_absolute_uri(settings.MEDIA_URL + saved_path)
+            media_url = settings.MEDIA_URL if settings.MEDIA_URL.endswith('/') else f"{settings.MEDIA_URL}/"
+            instance.photo_url = f"{media_url}{saved_path}"
             instance.save(update_fields=['photo_url'])
 
         if 'custom_data' in data:
