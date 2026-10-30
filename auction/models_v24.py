@@ -35,6 +35,8 @@ class AuctionTournamentConfig(BaseModel):
     auto_advance_queue = models.BooleanField(default=True)
     live_media_enabled = models.BooleanField(default=False)
     live_media_url = models.CharField(max_length=500, blank=True, null=True)
+    custom_messages = models.JSONField(default=dict, blank=True)
+    lot_order = models.CharField(max_length=20, default='random', blank=True)
 
 class AuctionCategory(BaseModel):
     auction = models.ForeignKey(Auction, on_delete=models.CASCADE, related_name='categories')

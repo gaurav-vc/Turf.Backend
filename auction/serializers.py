@@ -29,6 +29,7 @@ class SimplePlayerSerializer(serializers.ModelSerializer):
 class AuctionTeamSerializer(serializers.ModelSerializer):
     team_name = serializers.CharField(source='team.name', read_only=True)
     team_color = serializers.CharField(source='team.logo_color', default='#3b82f6', read_only=True)
+    team_logo = serializers.SerializerMethodField()
     captain_name = serializers.SerializerMethodField()
     captain_email = serializers.SerializerMethodField()
     players_count = serializers.SerializerMethodField()
@@ -37,6 +38,16 @@ class AuctionTeamSerializer(serializers.ModelSerializer):
     class Meta:
         model = AuctionTeam
         fields = '__all__'
+
+    def get_team_logo(self, obj):
+        if obj.team and getattr(obj.team, 'logo', None):
+            try:
+                request = self.context.get('request')
+                url = obj.team.logo.url
+                return request.build_absolute_uri(url) if request else url
+            except Exception:
+                return None
+        return None
 
     def get_captain_name(self, obj):
         if obj.team and obj.team.user:

@@ -77,12 +77,58 @@ class AuctionOverlaySerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 class GroupDrawCardSerializer(serializers.ModelSerializer):
-    team_name = serializers.CharField(source='team.team.name', read_only=True)
-    team_color = serializers.CharField(source='team.team.logo_color', default='#3b82f6', read_only=True)
+    team_name = serializers.SerializerMethodField()
+    team_color = serializers.SerializerMethodField()
+    team_short_name = serializers.SerializerMethodField()
+    team_logo = serializers.SerializerMethodField()
 
     class Meta:
         model = GroupDrawCard
         fields = '__all__'
+
+    def get_team_name(self, obj):
+        if not obj.team:
+            return None
+        if obj.team.team and getattr(obj.team.team, 'name', None):
+            return obj.team.team.name
+        if getattr(obj.team, 'custom_data', None):
+            return obj.team.custom_data.get('team_name', '')
+        return 'Team'
+
+    def get_team_short_name(self, obj):
+        if not obj.team:
+            return None
+        if getattr(obj.team, 'custom_data', None) and obj.team.custom_data.get('short_name'):
+            return obj.team.custom_data.get('short_name')
+        t_name = self.get_team_name(obj) or 'TM'
+        return t_name[:3].upper()
+
+    def get_team_color(self, obj):
+        if not obj.team:
+            return '#3b82f6'
+        if getattr(obj.team, 'custom_data', None) and obj.team.custom_data.get('color'):
+            return obj.team.custom_data.get('color')
+        if obj.team.team and getattr(obj.team.team, 'logo_color', None):
+            return obj.team.team.logo_color
+        return '#3b82f6'
+
+    def get_team_logo(self, obj):
+        if not obj.team:
+            return None
+        request = self.context.get('request')
+        if obj.team.team and getattr(obj.team.team, 'logo', None):
+            try:
+                url = obj.team.team.logo.url
+                return request.build_absolute_uri(url) if request else url
+            except Exception:
+                pass
+        if getattr(obj.team, 'custom_data', None):
+            c_logo = obj.team.custom_data.get('logo_url') or obj.team.custom_data.get('logo')
+            if c_logo:
+                if request and not (c_logo.startswith('http://') or c_logo.startswith('https://')):
+                    return request.build_absolute_uri(c_logo)
+                return c_logo
+        return None
 
 class AuctionTournamentConfigSerializer(serializers.ModelSerializer):
     class Meta:

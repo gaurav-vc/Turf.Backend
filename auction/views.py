@@ -184,6 +184,17 @@ class AuctionTeamViewSet(viewsets.ModelViewSet):
     serializer_class = AuctionTeamSerializer
     permission_classes = [permissions.IsAuthenticated]
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        auction_id = self.request.query_params.get('auction')
+        if auction_id:
+            try:
+                uuid_obj = uuid.UUID(str(auction_id))
+                return qs.filter(auction_id=uuid_obj)
+            except (ValueError, TypeError):
+                return qs.filter(auction_id=auction_id)
+        return qs
+
     @action(detail=True, methods=['post'])
     def update_purse(self, request, pk=None):
         """Adjust or set franchise wallet purse balance."""

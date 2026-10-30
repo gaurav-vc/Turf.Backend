@@ -26,15 +26,29 @@ class LiveAuctionEngine:
 
         if active_player:
             bids = active_player.bids.select_related('team__team').order_by('-created_at')[:10]
+            import re
             for b in bids:
                 t_name = b.team.team.name if b.team and b.team.team else "Team"
-                s_name = getattr(b.team.team, 'short_name', t_name[:3].upper()) if b.team and b.team.team else "TM"
+                cd = getattr(b.team, 'custom_data', {}) or {} if b.team else {}
+                s_name = cd.get('short_name') or (getattr(b.team.team, 'short_name', None) if b.team and b.team.team else None)
+                if not s_name:
+                    words = [w for w in re.split(r'[\s\-_]+', t_name) if w]
+                    s_name = "".join(w[0] for w in words)[:4].upper() if len(words) >= 2 else t_name[:3].upper()
+                t_logo = ""
+                if b.team and b.team.team and getattr(b.team.team, 'logo', None):
+                    try:
+                        t_logo = b.team.team.logo.url
+                    except Exception:
+                        t_logo = ""
+                if not t_logo and b.team and getattr(b.team, 'custom_data', None):
+                    t_logo = b.team.custom_data.get('logo_url', '')
                 bids_history.append({
                     'id': str(b.id),
                     'amount': float(b.amount),
                     'team_id': str(b.team.id),
                     'team_name': t_name,
                     'short_name': s_name,
+                    'team_logo': t_logo,
                     'bid_type': getattr(b, 'bid_type', 'Team Button'),
                     'created_at': b.created_at.isoformat(),
                 })
@@ -62,6 +76,52 @@ class LiveAuctionEngine:
             fin = team_financials(auction, team, active_player.id if active_player else None)
             teams_financials.append(fin)
 
+        # Dynamic real-time preview player (first available or upcoming from real tournament database)
+        preview_player = None
+        first_p = auction.players.filter(status='AVAILABLE').select_related('player').order_by('serial_no').first()
+        if not first_p:
+            first_p = auction.players.select_related('player').order_by('serial_no').first()
+        if first_p:
+            preview_player = {
+                'id': str(first_p.id),
+                'player_name': first_p.player.full_name or first_p.player.first_name if first_p.player else "Player",
+                'serial_no': first_p.serial_no or 1,
+                'category': first_p.category or "General",
+                'role': first_p.role or "All-Rounder",
+                'batting_style': first_p.batting_style or "Right Hand Bat",
+                'bowling_style': first_p.bowling_style or "Right Arm Medium",
+                'location': first_p.location or "",
+                'base_price': float(first_p.base_price or 0),
+                'photo_url': first_p.photo_url or "",
+                'status': first_p.status,
+                'custom_data': first_p.custom_data or {},
+            }
+
+        # Dynamic real-time most recently auctioned player
+        recent_p = auction.players.filter(status__in=['SOLD', 'UNSOLD']).select_related('player', 'sold_to__team').order_by('-updated_at').first()
+        recent_player = None
+        if recent_p:
+            recent_player = {
+                'id': str(recent_p.id),
+                'player_name': recent_p.player.full_name or recent_p.player.first_name if recent_p.player else "Player",
+                'serial_no': recent_p.serial_no or 1,
+                'category': recent_p.category or "General",
+                'role': recent_p.role or "All-Rounder",
+                'batting_style': recent_p.batting_style or "Right Hand Bat",
+                'bowling_style': recent_p.bowling_style or "Right Arm Medium",
+                'location': recent_p.location or "",
+                'base_price': float(recent_p.base_price or 0),
+                'sold_price': float(recent_p.sold_price or 0),
+                'sold_to_name': recent_p.sold_to.team.name if recent_p.sold_to and recent_p.sold_to.team else "",
+                'photo_url': recent_p.photo_url or "",
+                'status': recent_p.status,
+            }
+
+        total_players = auction.players.count()
+        sold_count = auction.players.filter(status='SOLD').count()
+        unsold_count = auction.players.filter(status='UNSOLD').count()
+        remaining_count = auction.players.filter(status='AVAILABLE').count()
+
         config = getattr(auction, 'v24_config', None)
         design = getattr(auction, 'page_design', None)
 
@@ -70,6 +130,15 @@ class LiveAuctionEngine:
             'auction_name': auction.name,
             'status': auction.status,
             'active_player': player_data,
+            'preview_player': preview_player,
+            'recent_player': recent_player,
+            'stats': {
+                'total_players': total_players,
+                'sold_count': sold_count,
+                'unsold_count': unsold_count,
+                'remaining_count': remaining_count,
+                'total_teams': len(teams_financials),
+            },
             'current_bid': highest_bid['amount'] if highest_bid else (player_data['base_price'] if player_data else 0),
             'highest_bid': highest_bid,
             'bid_history': bids_history,
@@ -89,12 +158,16 @@ class LiveAuctionEngine:
                 'completion_message': config.completion_message if config else 'Auction Completed - All teams are now completed',
                 'sold_animation_custom': (design.design_json.get('setup_rules_extended', {}).get('sold_animation_custom', '')) if design and design.design_json else '',
                 'highest_bid_animation_custom': (design.design_json.get('setup_rules_extended', {}).get('highest_bid_animation_custom', '')) if design and design.design_json else '',
+                'allow_multiple_bids': getattr(config, 'allow_multiple_bids', False) if config else False,
+                'auto_advance_queue': getattr(config, 'auto_advance_queue', True) if config else True,
+                'custom_messages': getattr(config, 'custom_messages', {}) if config else {},
+                'lot_order': getattr(config, 'lot_order', 'random') if config else 'random',
             } if config else {},
             'design': design.design_json if design else {},
         }
 
     @staticmethod
-    def place_bid(auction, team, amount=None, is_custom=False):
+    def place_bid(auction, team, amount=None, is_custom=False, allow_multiple=None):
         """
         Places a bid with authoritative Max Bid and slab verification.
         """
@@ -109,8 +182,12 @@ class LiveAuctionEngine:
         current_highest = player.bids.order_by('-amount').first()
         current_amount = current_highest.amount if current_highest else Decimal('0.00')
 
-        config = getattr(auction, 'v24_config', None)
-        allow_multiple = getattr(config, 'allow_multiple_bids', False) if config else False
+        if allow_multiple is None:
+            config = getattr(auction, 'v24_config', None)
+            if not config:
+                from ..models_v24 import AuctionTournamentConfig
+                config = AuctionTournamentConfig.objects.filter(auction=auction).first()
+            allow_multiple = bool(getattr(config, 'allow_multiple_bids', False)) if config else False
 
         if not allow_multiple and current_highest and current_highest.team_id == team.id:
             return False, f"{team.team.name} is already the highest bidder."
@@ -387,40 +464,44 @@ class LiveAuctionEngine:
     @staticmethod
     def select_next_player_by_category(auction, category=None):
         """
-        Puts the next available player on block, strictly respecting category priority or specific filter.
+        Puts the next available player on block, strictly respecting category priority or specific filter,
+        as well as configured lot_order (sequential 1, 2, 3... vs random).
         """
+        config = getattr(auction, 'v24_config', None)
+        lot_order = getattr(config, 'lot_order', 'random') if config else 'random'
+        order_fields = ['serial_no', 'created_at', 'id'] if lot_order == 'sequential' else ['?']
+
         player = None
         if category and category.strip() and category.upper() != 'ALL':
             qs = auction.players.filter(status__in=['AVAILABLE', 'PENDING'], category__iexact=category.strip())
-            player = qs.order_by('serial_no', 'created_at', 'id').first()
+            player = qs.order_by(*order_fields).first()
         else:
             # Respect category priority order configured in Master Setup & Rules
             cat_names = list(AuctionCategory.objects.filter(auction=auction).order_by('priority', 'display_order', 'created_at').values_list('name', flat=True))
             for cat_name in cat_names:
-                cat_qs = auction.players.filter(status__in=['AVAILABLE', 'PENDING'], category__iexact=cat_name).order_by('serial_no', 'created_at', 'id')
+                cat_qs = auction.players.filter(status__in=['AVAILABLE', 'PENDING'], category__iexact=cat_name).order_by(*order_fields)
                 if cat_qs.exists():
                     player = cat_qs.first()
                     break
             if not player:
-                player = auction.players.filter(status__in=['AVAILABLE', 'PENDING']).order_by('serial_no', 'created_at', 'id').first()
+                player = auction.players.filter(status__in=['AVAILABLE', 'PENDING']).order_by(*order_fields).first()
 
         if not player:
             # Fallback check for UNSOLD if bring_back_unsold is enabled
-            config = getattr(auction, 'v24_config', None)
             bring_back = config.bring_back_unsold if config else True
             if bring_back:
                 if category and category.strip() and category.upper() != 'ALL':
                     unsold_qs = auction.players.filter(status='UNSOLD', category__iexact=category.strip())
-                    player = unsold_qs.order_by('serial_no', 'created_at', 'id').first()
+                    player = unsold_qs.order_by(*order_fields).first()
                 else:
                     cat_names = list(AuctionCategory.objects.filter(auction=auction).order_by('priority', 'display_order', 'created_at').values_list('name', flat=True))
                     for cat_name in cat_names:
-                        cat_qs = auction.players.filter(status='UNSOLD', category__iexact=cat_name).order_by('serial_no', 'created_at', 'id')
+                        cat_qs = auction.players.filter(status='UNSOLD', category__iexact=cat_name).order_by(*order_fields)
                         if cat_qs.exists():
                             player = cat_qs.first()
                             break
                     if not player:
-                        player = auction.players.filter(status='UNSOLD').order_by('serial_no', 'created_at', 'id').first()
+                        player = auction.players.filter(status='UNSOLD').order_by(*order_fields).first()
 
         if not player:
             if category and category.strip() and category.upper() != 'ALL':

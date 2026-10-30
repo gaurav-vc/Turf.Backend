@@ -295,10 +295,26 @@ def team_financials(auction, team, current_player_id=None):
 
     max_bid = max(Decimal('0.00'), kitty - (spent + future_base_cost + reserve))
 
+    t_logo = ''
+    if team.team and getattr(team.team, 'logo', None):
+        try:
+            t_logo = team.team.logo.url
+        except Exception:
+            pass
+
+    t_name = team.team.name if team.team else 'Team'
+    import re
+    words = [w for w in re.split(r'[\s\-_]+', t_name) if w]
+    auto_short = ("".join(w[0] for w in words)[:4].upper()) if len(words) >= 2 else t_name[:3].upper()
+    cd = getattr(team, 'custom_data', {}) or {}
+    s_name = cd.get('short_name') or getattr(team.team, 'short_name', None) or auto_short
+
     return {
         'team_id': str(team.id),
-        'team_name': team.team.name if team.team else 'Team',
-        'short_name': getattr(team.team, 'short_name', team.team.name[:3].upper()) if team.team else 'TM',
+        'team_name': t_name,
+        'short_name': s_name,
+        'team_color': getattr(team.team, 'logo_color', '#3b82f6') if team.team else '#3b82f6',
+        'team_logo': t_logo,
         'kitty': float(kitty),
         'spent': float(spent),
         'balance': float(balance),

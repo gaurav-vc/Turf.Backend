@@ -163,12 +163,14 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
         team_id = request.data.get('team_id')
         amount = request.data.get('amount')
         is_custom = request.data.get('is_custom', False)
+        allow_multiple_raw = request.data.get('allow_multiple')
+        allow_multiple = str(allow_multiple_raw).lower() in ['true', '1', 'yes'] if allow_multiple_raw is not None else None
 
         team = auction.teams.filter(id=team_id).first()
         if not team:
             return Response({'error': 'Team not found in this auction'}, status=status.HTTP_404_NOT_FOUND)
 
-        ok, result = LiveAuctionEngine.place_bid(auction, team, amount, is_custom)
+        ok, result = LiveAuctionEngine.place_bid(auction, team, amount, is_custom, allow_multiple=allow_multiple)
         if not ok:
             return Response({'error': result}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -577,6 +579,10 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
 
         if request.method == 'GET':
             teams_qs = auction.teams.select_related('team', 'team__user').all()
+            config, _ = AuctionTournamentConfig.objects.get_or_create(auction=auction)
+            all_cats = list(auction.categories.all().order_by('priority', 'display_order').values('name', 'target_count', 'min_players', 'max_players'))
+            max_sq = config.max_squad or 11
+
             data = []
             for at in teams_qs:
                 t = at.team
@@ -592,6 +598,13 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
 
                 if logo_val and not (logo_val.startswith('http://') or logo_val.startswith('https://')):
                     logo_val = request.build_absolute_uri(logo_val)
+
+                fin = team_financials(auction, at)
+                sold_players = list(auction.players.filter(sold_to=at, status='SOLD'))
+                cat_counts = {}
+                for p in sold_players:
+                    c = (p.category or 'General').strip()
+                    cat_counts[c] = cat_counts.get(c, 0) + 1
 
                 data.append({
                     'id': str(at.id),
@@ -613,7 +626,11 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                     'reserve_amount': float(at.reserve_amount or 0),
                     'sponsor_name': at.custom_data.get('sponsor_name', ''),
                     'remaining_budget': float(at.remaining_budget or 0),
-                    'players_count': auction.players.filter(sold_to=at).count(),
+                    'max_bid': fin.get('max_bid', float(at.remaining_budget or 0)),
+                    'category_counts': cat_counts,
+                    'categories_meta': all_cats,
+                    'max_squad': max_sq,
+                    'players_count': len(sold_players),
                     'live_token': at.live_token or '',
                 })
             return Response(data)
@@ -1222,7 +1239,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                         team = None
                         try:
                             team_uuid = uuid.UUID(str(team_id))
-                            team = auction.teams.filter(id=team_uuid).first()
+                            team = auction.teams.filter(id=team_uuid).first() or auction.teams.filter(team__id=team_uuid).first()
                         except (ValueError, TypeError, Exception):
                             team = auction.teams.filter(id=team_id).first()
                         if not team:
@@ -1260,7 +1277,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 auction.group_cards.all().delete()
 
         cards = auction.group_cards.all().order_by('card_number')
-        return Response(GroupDrawCardSerializer(cards, many=True).data)
+        return Response(GroupDrawCardSerializer(cards, many=True, context={'request': request}).data)
 
     @action(detail=True, methods=['get'])
     def all_teams_report(self, request, pk=None):
@@ -2075,18 +2092,43 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             body_style = ParagraphStyle('BodyStyle', fontName='Helvetica', fontSize=8.5, leading=11, textColor=colors.HexColor('#1C2A38'))
             th_style = ParagraphStyle('ThStyle', fontName='Helvetica-Bold', fontSize=8.5, leading=11, textColor=colors.HexColor('#0F172A'))
 
+            meta_style = ParagraphStyle('MetaStyle', fontName='Helvetica-Bold', fontSize=9, leading=13, textColor=colors.HexColor('#334155'))
+            summary_style = ParagraphStyle('SummaryStyle', fontName='Helvetica', fontSize=8.5, leading=12, textColor=colors.HexColor('#0284C7'))
+
             story = [
                 Paragraph(str(auction_name), head_style),
                 Spacer(1, 4*mm)
             ]
 
+            config, _ = AuctionTournamentConfig.objects.get_or_create(auction=auction) if auction else (None, None)
+
             for idx, tm in enumerate(teams):
                 tm_name = tm.team.name if tm.team else 'Team'
                 tm_short = getattr(tm.team, 'short_name', tm_name[:3].upper()) if tm.team else 'TM'
-                story.append(Paragraph(f"{tm_short} — {tm_name}", team_head_style))
-                story.append(Spacer(1, 2*mm))
+                owner_name = tm.team.user.full_name or tm.team.user.first_name if tm.team and tm.team.user else getattr(tm.team, 'owner_name', 'Owner')
+                story.append(Paragraph(f"{tm_short} — {tm_name} (Owner: {owner_name})", team_head_style))
+                story.append(Spacer(1, 1.5*mm))
 
-                sold_players = auction.players.filter(sold_to=tm, status='SOLD').order_by('serial_no')
+                fin = team_financials(auction, tm)
+                init_kitty = auction.base_budget if auction else Decimal('0.00')
+                bal_kitty = tm.remaining_budget
+                max_bid = fin.get('max_bid', float(bal_kitty))
+
+                sold_players = list(auction.players.filter(sold_to=tm, status='SOLD').order_by('serial_no')) if auction else []
+
+                cat_counts = {}
+                for p in sold_players:
+                    c = p.category or 'General'
+                    cat_counts[c] = cat_counts.get(c, 0) + 1
+                cat_summary_str = " • ".join([f"{c}: {cnt}" for c, cnt in cat_counts.items()]) if cat_counts else "None"
+                total_squad_str = f"Total Squad: {len(sold_players)} / {config.max_squad if config else 11}"
+
+                fin_text = f"<b>Initial Kitty:</b> ₹{int(init_kitty):,} &nbsp;|&nbsp; <b>Balance Kitty:</b> ₹{int(bal_kitty):,} &nbsp;|&nbsp; <b>Max Bid:</b> ₹{int(max_bid):,}"
+                story.append(Paragraph(fin_text, meta_style))
+                story.append(Spacer(1, 1*mm))
+                story.append(Paragraph(f"<b>Categories:</b> {cat_summary_str} &nbsp;|&nbsp; <b>{total_squad_str}</b>", summary_style))
+                story.append(Spacer(1, 2.5*mm))
+
                 data = [[
                     Paragraph('Player No.', th_style),
                     Paragraph('Name', th_style),
@@ -2238,21 +2280,115 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @action(detail=True, methods=['get', 'post'], url_path='export_owners_pdf', permission_classes=[permissions.AllowAny])
+    def export_owners_pdf(self, request, pk=None):
+        """
+        Generates and downloads a dedicated Franchise Owners & Kitty PDF report.
+        """
+        auction = self._get_auction(pk)
+        auction_name = auction.name if auction else 'Auction'
+        teams = list(auction.teams.select_related('team', 'team__user').all()) if auction else []
+
+        try:
+            import io
+            from reportlab.lib import colors
+            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.lib.units import mm
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from django.http import HttpResponse
+
+            out = io.BytesIO()
+            doc = SimpleDocTemplate(
+                out,
+                pagesize=landscape(A4),
+                leftMargin=12*mm,
+                rightMargin=12*mm,
+                topMargin=12*mm,
+                bottomMargin=12*mm,
+                title=f"{auction_name} - Franchise Owners & Kitty"
+            )
+            styles = getSampleStyleSheet()
+            head_style = ParagraphStyle('OwnerHead', fontName='Helvetica-Bold', fontSize=18, leading=22, textColor=colors.HexColor('#0B1B35'))
+            th_style = ParagraphStyle('OwnerTh', fontName='Helvetica-Bold', fontSize=9, leading=12, textColor=colors.HexColor('#0F172A'))
+            body_style = ParagraphStyle('OwnerBody', fontName='Helvetica', fontSize=8.5, leading=11, textColor=colors.HexColor('#1E293B'))
+
+            story = [
+                Paragraph(f"{auction_name} — Franchise Owners & Team Profile Summary", head_style),
+                Spacer(1, 5*mm)
+            ]
+
+            owners_data = [[
+                Paragraph('#', th_style),
+                Paragraph('Team Name', th_style),
+                Paragraph('Short Name', th_style),
+                Paragraph('Owner Name', th_style),
+                Paragraph('Mobile', th_style),
+                Paragraph('Email ID', th_style),
+                Paragraph('Total Kitty', th_style),
+                Paragraph('Balance Kitty', th_style),
+                Paragraph('Squad Bought', th_style)
+            ]]
+
+            for idx, tm in enumerate(teams, 1):
+                t_name = tm.team.name if tm.team else 'Team'
+                t_short = getattr(tm.team, 'short_name', t_name[:3].upper()) if tm.team else 'TM'
+                owner_name = tm.team.user.full_name or tm.team.user.first_name if tm.team and tm.team.user else getattr(tm.team, 'owner_name', 'Owner')
+                mobile = getattr(tm.team, 'owner_mobile', getattr(tm.team.user, 'mobile_number', '—')) if tm.team else '—'
+                email = getattr(tm.team, 'owner_email', getattr(tm.team.user, 'email', '—')) if tm.team else '—'
+                init_purse = auction.base_budget if auction else 50000
+                rem_purse = tm.remaining_budget
+                bought_count = auction.players.filter(sold_to=tm, status='SOLD').count() if auction else 0
+
+                owners_data.append([
+                    Paragraph(str(idx), body_style),
+                    Paragraph(str(t_name), body_style),
+                    Paragraph(str(t_short), body_style),
+                    Paragraph(str(owner_name), body_style),
+                    Paragraph(str(mobile or '—'), body_style),
+                    Paragraph(str(email or '—'), body_style),
+                    Paragraph(f"₹{int(init_purse):,}", body_style),
+                    Paragraph(f"₹{int(rem_purse):,}", body_style),
+                    Paragraph(str(bought_count), body_style)
+                ])
+
+            if len(owners_data) == 1:
+                owners_data.append([Paragraph('—', body_style)] * 9)
+
+            tbl = Table(owners_data, colWidths=[10*mm, 45*mm, 22*mm, 42*mm, 32*mm, 48*mm, 28*mm, 28*mm, 18*mm], repeatRows=1)
+            tbl.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#EEF2FF')),
+                ('TEXTCOLOR', (0,0), (-1,0), colors.HexColor('#312E81')),
+                ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E1')),
+                ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+                ('TOPPADDING', (0,0), (-1,-1), 4),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+            ]))
+            story.append(tbl)
+
+            doc.build(story)
+            out.seek(0)
+            response = HttpResponse(out.getvalue(), content_type='application/pdf')
+            response['Content-Disposition'] = f'attachment; filename="{auction_name}_Franchise_Owners.pdf"'
+            return response
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
     @action(detail=True, methods=['get', 'post'], permission_classes=[permissions.AllowAny])
     def export_booklet_pdf(self, request, pk=None):
         """
         Merge and download complete multi-page tournament booklet:
         Page 1: Cover Page (Title, Logo, Total Teams & Players, Venue, Date)
         Page 2: Franchise Owners & Purse Kitty Summary
-        Page 3+: Full Team Squad Breakdowns
-        Page N+: Category-Wise Player Pool
+        Page 3+: Category-Wise Player Pool
+        (Note: Team squad breakdown is excluded from booklet as standalone info).
         """
         auction = self._get_auction(pk)
         auction_name = auction.name if auction else 'Auction'
         config, _ = AuctionTournamentConfig.objects.get_or_create(auction=auction) if auction else (None, None)
 
         teams = list(auction.teams.select_related('team', 'team__user').all()) if auction else []
-        players = list(auction.players.select_related('player', 'sold_to', 'sold_to__team').all().order_by('serial_no', 'id')) if auction else []
+        players = list(auction.players.select_related('player', 'sold_to', 'sold_to__team').all().order_by('category', 'serial_no', 'id')) if auction else []
 
         try:
             import io
@@ -2286,7 +2422,6 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
 
             # ---------------- PAGE 1: COVER PAGE ----------------
             story.append(Spacer(1, 20*mm))
-            # Tournament Logo if available locally
             if config and config.tournament_logo:
                 try:
                     logo_rel = config.tournament_logo.replace(settings.MEDIA_URL, '').lstrip('/')
@@ -2374,47 +2509,66 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             story.append(owners_tbl)
             story.append(PageBreak())
 
-            # ---------------- PAGE 3+: SQUADS BREAKDOWN ----------------
-            story.append(Paragraph("Franchise Team Squads", section_head_style))
+            # ---------------- PAGE 3+: CATEGORY-WISE PLAYER POOL ----------------
+            story.append(Paragraph("Category-Wise Player Roster", section_head_style))
             story.append(Spacer(1, 4*mm))
 
-            for t_idx, tm in enumerate(teams):
-                t_name = tm.team.name if tm.team else 'Team'
-                t_short = getattr(tm.team, 'short_name', t_name[:3].upper()) if tm.team else 'TM'
-                sold_players = list(auction.players.filter(sold_to=tm, status='SOLD').order_by('serial_no')) if auction else []
+            categories = list(auction.categories.all().order_by('priority', 'display_order')) if auction else []
+            cat_names = [c.name for c in categories]
+            grouped = {}
+            for p in players:
+                cat = p.category or 'General'
+                grouped.setdefault(cat, []).append(p)
 
-                story.append(Paragraph(f"{t_short} — {t_name} (Remaining: ₹{int(tm.remaining_budget):,})", ParagraphStyle('TmTitle', fontName='Helvetica-Bold', fontSize=12, leading=15, textColor=colors.HexColor('#1E293B'))))
+            ordered_cats = [c for c in cat_names if c in grouped] + [c for c in grouped if c not in cat_names]
+            if not ordered_cats:
+                ordered_cats = list(grouped.keys())
+
+            for c_idx, c_name in enumerate(ordered_cats):
+                cat_players = grouped.get(c_name, [])
+                story.append(Paragraph(f"Category: {c_name} ({len(cat_players)} Players)", ParagraphStyle('CatTitleStyle', fontName='Helvetica-Bold', fontSize=12, leading=15, textColor=colors.HexColor('#4338CA'))))
                 story.append(Spacer(1, 2*mm))
 
-                t_data = [[
+                c_data = [[
                     Paragraph('No.', th_style),
                     Paragraph('Player Name', th_style),
                     Paragraph('Role', th_style),
-                    Paragraph('Category', th_style),
-                    Paragraph('Sold Amount', th_style)
+                    Paragraph('Base Price', th_style),
+                    Paragraph('Status', th_style),
+                    Paragraph('Sold Team / Price', th_style)
                 ]]
-                for p in sold_players:
+
+                for p in cat_players:
                     p_name = p.player.full_name or p.player.first_name if p.player else 'Player'
-                    t_data.append([
+                    sold_info = '—'
+                    if p.status == 'SOLD':
+                        tm_name = p.sold_to.team.name if p.sold_to and p.sold_to.team else 'Assigned Team'
+                        sold_info = f"{tm_name} (₹{int(p.sold_price or 0):,})"
+                    elif p.status == 'UNSOLD':
+                        sold_info = 'Unsold'
+
+                    c_data.append([
                         Paragraph(str(p.serial_no or '—'), body_style),
                         Paragraph(str(p_name), body_style),
                         Paragraph(str(p.role or '—'), body_style),
-                        Paragraph(str(p.category or '—'), body_style),
-                        Paragraph(f"₹{int(p.sold_price or 0):,}", body_style)
+                        Paragraph(f"₹{int(p.base_price or 0):,}", body_style),
+                        Paragraph(str(p.status), body_style),
+                        Paragraph(str(sold_info), body_style)
                     ])
 
-                if len(t_data) == 1:
-                    t_data.append([Paragraph('—', body_style), Paragraph('No players bought yet', body_style), Paragraph('—', body_style), Paragraph('—', body_style), Paragraph('—', body_style)])
+                if len(c_data) == 1:
+                    c_data.append([Paragraph('—', body_style), Paragraph('No players in this category', body_style), Paragraph('—', body_style), Paragraph('—', body_style), Paragraph('—', body_style), Paragraph('—', body_style)])
 
-                squad_tbl = Table(t_data, colWidths=[18*mm, 55*mm, 35*mm, 40*mm, 32*mm], repeatRows=1)
-                squad_tbl.setStyle(TableStyle([
-                    ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#F1F5F9')),
+                cat_tbl = Table(c_data, colWidths=[15*mm, 50*mm, 32*mm, 25*mm, 22*mm, 38*mm], repeatRows=1)
+                cat_tbl.setStyle(TableStyle([
+                    ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#EEF2FF')),
+                    ('TEXTCOLOR', (0,0), (-1,0), colors.HexColor('#312E81')),
                     ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E1')),
                     ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-                    ('TOPPADDING', (0,0), (-1,-1), 3),
-                    ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+                    ('TOPPADDING', (0,0), (-1,-1), 3.5),
+                    ('BOTTOMPADDING', (0,0), (-1,-1), 3.5),
                 ]))
-                story.extend([squad_tbl, Spacer(1, 6*mm)])
+                story.extend([cat_tbl, Spacer(1, 6*mm)])
 
             doc.build(story)
             out.seek(0)
@@ -2955,6 +3109,10 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             elif 'category_wise_bidding' in data:
                 config.category_wise_bidding = str(data.get('category_wise_bidding')).lower() in ['true', '1']
 
+            lot_order = data.get('lot_order') or data.get('player_lot_order')
+            if lot_order in ['random', 'sequential']:
+                config.lot_order = lot_order
+
             # 3. Squad Rules & Budget
             max_squad = data.get('max_squad')
             if max_squad is not None:
@@ -2991,6 +3149,30 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 config.allow_multiple_bids = str(data.get('allow_multiple_bids')).lower() in ['true', '1', 'on', 'yes']
             if 'auto_advance_queue' in data:
                 config.auto_advance_queue = str(data.get('auto_advance_queue')).lower() in ['true', '1', 'on', 'yes']
+
+            # Broadcast Announcements & System Messages (Sheet 1 requirement 6)
+            msg_fields = [
+                'msg_post_sold',
+                'msg_unsold_pool',
+                'msg_category_complete',
+                'msg_team_cat_quota',
+                'msg_team_squad_complete',
+                'msg_auction_complete'
+            ]
+            current_msgs = dict(getattr(config, 'custom_messages', {}) or {})
+            if 'custom_messages' in data:
+                raw_msgs = data.get('custom_messages')
+                if isinstance(raw_msgs, str):
+                    try:
+                        raw_msgs = json.loads(raw_msgs)
+                    except Exception:
+                        raw_msgs = {}
+                if isinstance(raw_msgs, dict):
+                    current_msgs.update(raw_msgs)
+            for mf in msg_fields:
+                if mf in data:
+                    current_msgs[mf] = str(data[mf]).strip()
+            config.custom_messages = current_msgs
 
             # 4. SOLD Celebration Animations
             if 'sold_animation' in data:
@@ -3333,6 +3515,8 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 'overall_background': config.overall_background or 'default',
                 'allow_multiple_bids': getattr(config, 'allow_multiple_bids', False),
                 'auto_advance_queue': getattr(config, 'auto_advance_queue', True),
+                'custom_messages': getattr(config, 'custom_messages', {}) or {},
+                'lot_order': getattr(config, 'lot_order', 'random') or 'random',
                 'online_timer_enabled': config.online_timer_enabled,
                 'timer_seconds': config.timer_seconds or 30,
                 'closing_wait_seconds': config.closing_wait_seconds or 5,
