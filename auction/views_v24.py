@@ -880,6 +880,65 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             }
         })
 
+    @action(detail=True, methods=['post', 'delete'], url_path='delete_all_teams')
+    def delete_all_teams(self, request, pk=None):
+        """Removes all franchise teams from this auction and releases assigned players."""
+        auction = self._get_auction(pk)
+        teams = auction.teams.all()
+        count = teams.count()
+        auction.players.filter(sold_to__in=teams).update(
+            sold_to=None,
+            sold_price=Decimal('0'),
+            status='AVAILABLE'
+        )
+        teams.delete()
+        return Response({
+            'success': True,
+            'message': f'Successfully deleted all {count} franchise teams.',
+            'deleted_count': count
+        })
+
+    @action(detail=True, methods=['post', 'delete'], url_path='delete_all_players')
+    def delete_all_players(self, request, pk=None):
+        """Removes all players from this auction roster."""
+        auction = self._get_auction(pk)
+        players = auction.players.all()
+        count = players.count()
+        players.delete()
+        return Response({
+            'success': True,
+            'message': f'Successfully deleted all {count} players from the roster.',
+            'deleted_count': count
+        })
+
+    @action(detail=True, methods=['post', 'delete'], url_path='bulk_delete_players')
+    def bulk_delete_players(self, request, pk=None):
+        """Deletes selected players by their IDs."""
+        auction = self._get_auction(pk)
+        raw_ids = request.data.get('player_ids', [])
+        if not raw_ids or not isinstance(raw_ids, list):
+            return Response({'error': 'No player IDs provided for deletion.'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        clean_ids = [str(pid).strip() for pid in raw_ids if str(pid).strip()]
+        qs = auction.players.filter(id__in=clean_ids)
+        count = qs.count()
+        qs.delete()
+        return Response({
+            'success': True,
+            'message': f'Successfully deleted {count} selected player(s).',
+            'deleted_count': count
+        })
+
+    @action(detail=True, methods=['delete'], url_path='players/(?P<player_id>[^/.]+)')
+    def player_detail(self, request, pk=None, player_id=None):
+        """Delete an individual player from the auction."""
+        auction = self._get_auction(pk)
+        player = auction.players.filter(pk=player_id).first()
+        if not player:
+            return Response({'error': 'Auction player not found.'}, status=status.HTTP_404_NOT_FOUND)
+        player.delete()
+        return Response({'success': True, 'message': 'Player removed successfully.'})
+
     @action(detail=True, methods=['get'], permission_classes=[permissions.AllowAny])
     def teams_template(self, request, pk=None):
         """Generates downloadable CSV template for teams bulk import."""
