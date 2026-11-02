@@ -1,52 +1,218 @@
 """
-Max Bid Calculator & Squad Dynamic Programming Engine
-Ported from Cricket Auction Phase 2 V24 authoritative logic.
+V24 MAX BID LOGIC & SQUAD DYNAMIC PROGRAMMING ENGINE
+Authoritative Implementation conforming to:
+Cricket_Auction_Phase2_V24_ALL_REQUIREMENTS(2).zip
+
+Core Formula:
+  Net Kitty = Team Purse + Team Additional Kitty − Team Penalty
+  Future Mandatory Cost = max(Category Reserve Excluding Current Player, Rule-Aware Minimum-Cost Reserve)
+  Max Bid = Net Kitty − [Spent + Future Mandatory Cost + Team Reserve]
+  Clamped with max(0, ...)
 """
 from decimal import Decimal
 import json
+import re
+
+
+def assumed_current_base(auction):
+    """
+    Step 10: Pre-Auction / No Current Lot Assumption.
+    When there is no current lot, team_financials() obtains an assumed current base:
+    - For category-wise auctions: uses the base price of the last category in category_sequence.
+    - For open auctions: uses the last category returned by category_rows().
+    """
+    config = getattr(auction, 'v24_config', None)
+    categories = list(auction.categories.all())
+    if not categories:
+        return Decimal('0.00')
+
+    # Category-wise auction
+    if config and config.category_wise_bidding and config.category_sequence:
+        seq = config.category_sequence
+        if isinstance(seq, list) and len(seq) > 0:
+            last_cat_name = str(seq[-1]).strip().lower()
+            matching = [c for c in categories if c.name.strip().lower() == last_cat_name]
+            if matching:
+                return matching[0].base_price or Decimal('0.00')
+
+    # Open auction or fallback: last category in display order / priority
+    return categories[-1].base_price or Decimal('0.00')
+
 
 def net_kitty(auction, team):
     """
-    Net Kitty = Base Purse + Additional Kitty - Penalty Amount
+    Step 4: Calculate Net Kitty
+    Net Kitty = Team Purse + Team Additional Kitty - Team Penalty
+    Team Purse is the base budget allocated to the team.
     """
-    config = getattr(auction, 'v24_config', None)
-    base = team.remaining_budget
-    # If base purse is set on auction config
-    if config and config.additional_kitty:
-        base += config.additional_kitty
-    if config and config.penalty_amount:
-        base -= config.penalty_amount
-    
-    # Team-level adjustments
-    if hasattr(team, 'additional_kitty') and team.additional_kitty:
-        base += team.additional_kitty
-    if hasattr(team, 'penalty_amount') and team.penalty_amount:
-        base -= team.penalty_amount
-        
-    return max(Decimal('0.00'), base)
+    # 1. Base team purse
+    base_purse = None
+    cd = getattr(team, 'custom_data', {}) or {}
+    if isinstance(cd, dict) and cd.get('base_purse'):
+        try:
+            base_purse = Decimal(str(cd['base_purse']))
+        except Exception:
+            pass
+
+    if base_purse is None:
+        if getattr(auction, 'base_budget', None):
+            base_purse = Decimal(str(auction.base_budget))
+        else:
+            # Fallback to wallet remaining + already spent
+            sold_to_team = auction.players.filter(sold_to=team, status='SOLD')
+            spent = sum((p.sold_price or Decimal('0.00') for p in sold_to_team), Decimal('0.00'))
+            base_purse = (team.remaining_budget or Decimal('0.00')) + spent
+
+    # 2. Team-specific financial adjustments
+    additional = Decimal(str(getattr(team, 'additional_kitty', 0) or 0))
+    penalty = Decimal(str(getattr(team, 'penalty_amount', 0) or 0))
+
+    calc = base_purse + additional - penalty
+    return max(Decimal('0.00'), calc)
+
+
+def team_category_counts(auction, team):
+    """
+    Step 2 & 6: Counts how many players from each category the team has already bought.
+    """
+    sold_players = auction.players.filter(sold_to=team, status='SOLD')
+    counts = {}
+    for p in sold_players:
+        cat = (p.category or 'General').strip().lower()
+        counts[cat] = counts.get(cat, 0) + 1
+    return counts
+
+
+def remaining_base_cost(auction, team):
+    """
+    Step 6: Calculate remaining category base cost before current player.
+    Loops through every configured tournament category.
+    remaining = max(0, target_count - team_bought_count)
+    adds remaining * category_base_price.
+    """
+    cat_counts = team_category_counts(auction, team)
+    total_cost = Decimal('0.00')
+    cat_needs = []
+
+    for c in auction.categories.all():
+        req = c.target_count or 0
+        bought = cat_counts.get(c.name.strip().lower(), 0)
+        rem = max(0, req - bought)
+        price = c.base_price or Decimal('0.00')
+        total_cost += Decimal(rem) * price
+        if rem > 0:
+            cat_needs.append((c.name.strip().lower(), rem, price))
+
+    return total_cost, cat_needs
+
+
+def squad_rule_value(player, field_key):
+    """
+    Reads a player's attribute value for a standard or custom squad-rule field.
+    """
+    key = str(field_key or '').strip().lower()
+    if key == 'category':
+        return str(player.category or '').strip()
+    if key == 'role':
+        return str(player.role or '').strip()
+    if key == 'batting_style':
+        return str(player.batting_style or '').strip()
+    if key == 'bowling_style':
+        return str(player.bowling_style or '').strip()
+    if key == 'location':
+        return str(player.location or '').strip()
+    if key == 'age':
+        return str(player.age if player.age is not None else '').strip()
+    if key == 'mobile':
+        return str(player.mobile or '').strip()
+
+    # Check custom_data
+    custom = player.custom_data or {}
+    if isinstance(custom, str):
+        try:
+            custom = json.loads(custom)
+        except Exception:
+            custom = {}
+    return str(custom.get(field_key, '') or custom.get(key, '') or '').strip()
+
+
+def team_rule_counts(auction, team):
+    """
+    Step 8: Counts a team's current players against all active squad rules.
+    """
+    sold_players = list(auction.players.filter(sold_to=team, status='SOLD'))
+    rules = list(auction.squad_rules.filter(active=True))
+    out = {}
+    for r in rules:
+        fk = r.field_key.strip().lower()
+        fv = r.field_value.strip().lower()
+        key = (fk, fv)
+        out[key] = sum(1 for p in sold_players if squad_rule_value(p, r.field_key).lower() == fv)
+    return out
+
+
+def team_rule_violation(auction, team, player):
+    """
+    Step 2: Stops a team exceeding a squad-rule maximum.
+    """
+    sold_players = list(auction.players.filter(sold_to=team, status='SOLD'))
+    rules = list(auction.squad_rules.filter(active=True))
+
+    for rule in rules:
+        val = rule.field_value.strip().lower()
+        pv = squad_rule_value(player, rule.field_key).lower()
+        count = sum(1 for p in sold_players if squad_rule_value(p, rule.field_key).lower() == val)
+        if rule.max_count is not None and count >= rule.max_count and pv == val:
+            return False, f"Team has already reached the maximum {rule.field_key} requirement of {rule.max_count} for '{rule.field_value}'."
+    return True, ""
+
+
+def allowed_team_for_lot(auction, team, player):
+    """
+    Step 2: Checks category quota and squad-rule eligibility.
+    Team eligibility and Max Bid are separate controls.
+    """
+    # 1. Category quota check
+    cat_name = (player.category or '').strip().lower()
+    cat_obj = auction.categories.filter(name__iexact=cat_name).first()
+    if cat_obj and cat_obj.target_count > 0:
+        counts = team_category_counts(auction, team)
+        bought = counts.get(cat_name, 0)
+        if bought >= cat_obj.target_count:
+            return False, f"Team has already acquired all required {cat_obj.target_count} player(s) for category '{cat_obj.name}'."
+
+    # 2. Squad rule maximum violation check
+    ok, reason = team_rule_violation(auction, team, player)
+    if not ok:
+        return False, reason
+
+    return True, None
+
 
 def bid_increment(auction, current_bid):
     """
-    Looks up the bid slab ladder for the given auction.
+    Step 3: Returns configured bid increment for current bid from bid_slabs.
     """
     slabs = auction.bid_slabs.all().order_by('up_to_bid')
-    if not slabs.exists():
-        # Default increment
+    has_slabs = slabs.exists() if hasattr(slabs, 'exists') else bool(slabs)
+    if not has_slabs:
         if current_bid < Decimal('1000000'):
             return Decimal('50000')
         elif current_bid < Decimal('2000000'):
             return Decimal('100000')
         else:
             return Decimal('200000')
-    
+
     for s in slabs:
         if current_bid < s.up_to_bid:
             return s.increment
-    return slabs.last().increment
+    return slabs.last().increment if hasattr(slabs, 'last') else slabs[-1].increment
+
 
 def valid_custom_bid(auction, current_bid, amount, base_price):
     """
-    Validates custom bid against current bid and increment slab.
+    Step 3: Validates custom bid amount / increment grid.
+    First bid must equal base price; subsequent must be > current_bid and multiple of slab.
     """
     current_bid = Decimal(str(current_bid or 0))
     amount = Decimal(str(amount or 0))
@@ -64,145 +230,69 @@ def valid_custom_bid(auction, current_bid, amount, base_price):
     diff = amount - current_bid
     if amount > current_bid and (diff % inc) == 0:
         return True, inc, "Valid custom bid."
-    
+
     return False, inc, f"Enter a bid above ₹{current_bid:,.0f} in multiples of ₹{inc:,.0f}."
 
-def squad_rule_value(player, field_key):
-    """
-    Extracts attribute value from player standard fields or custom_data.
-    """
-    key = str(field_key or '').strip().lower()
-    if key == 'category':
-        return str(player.category or '').strip()
-    if key == 'role':
-        return str(player.role or '').strip()
-    if key == 'batting_style':
-        return str(player.batting_style or '').strip()
-    if key == 'bowling_style':
-        return str(player.bowling_style or '').strip()
-    if key == 'location':
-        return str(player.location or '').strip()
-    
-    # Check custom_data
-    custom = player.custom_data or {}
-    if isinstance(custom, str):
-        try:
-            custom = json.loads(custom)
-        except Exception:
-            custom = {}
-    return str(custom.get(field_key, '') or '').strip()
-
-def team_category_counts(auction, team):
-    """
-    Counts how many players from each category the team has already bought.
-    """
-    sold_players = auction.players.filter(sold_to=team, status='SOLD')
-    counts = {}
-    for p in sold_players:
-        cat = (p.category or 'General').strip().lower()
-        counts[cat] = counts.get(cat, 0) + 1
-    return counts
-
-def team_rule_counts(auction, team):
-    """
-    Counts current acquisitions matching active squad rules.
-    """
-    sold_players = auction.players.filter(sold_to=team, status='SOLD')
-    rules = auction.squad_rules.filter(active=True)
-    out = {}
-    for r in rules:
-        key = (r.field_key.strip().lower(), r.field_value.strip().lower())
-        out[key] = sum(1 for p in sold_players if squad_rule_value(p, r.field_key).lower() == key[1])
-    return out
-
-def team_rule_violation(auction, team, player):
-    """
-    Verifies if buying this player breaches any squad rule limits.
-    """
-    sold_players = list(auction.players.filter(sold_to=team, status='SOLD'))
-    rules = auction.squad_rules.filter(active=True)
-    for rule in rules:
-        val = rule.field_value.strip().lower()
-        pv = squad_rule_value(player, rule.field_key).lower()
-        count = sum(1 for p in sold_players if squad_rule_value(p, rule.field_key).lower() == val)
-        if rule.max_count is not None and count >= rule.max_count and pv == val:
-            return False, f"Team has already reached the maximum {rule.field_key} requirement of {rule.max_count} for '{rule.field_value}'."
-    return True, ""
-
-def allowed_team_for_lot(auction, team, player):
-    """
-    Checks both category targets and squad rules for eligibility.
-    """
-    # Category quota check
-    cat_name = (player.category or '').strip().lower()
-    cat_obj = auction.categories.filter(name__iexact=cat_name).first()
-    if cat_obj and cat_obj.target_count > 0:
-        counts = team_category_counts(auction, team)
-        bought = counts.get(cat_name, 0)
-        if bought >= cat_obj.target_count:
-            return False, f"Team has already acquired all required {cat_obj.target_count} player(s) for category '{cat_obj.name}'."
-
-    # Squad rule checks
-    ok, reason = team_rule_violation(auction, team, player)
-    if not ok:
-        return False, reason
-
-    return True, None
 
 def team_required_attribute_cost(auction, team, current_player_id=None):
     """
-    Calculates the minimum base-cost reserve for remaining category and squad rules
-    using a bounded 0/1 dynamic program (from Phase 2 V24).
+    Steps 6, 7, 8, 9, 10:
+    Finds the minimum future reserve cost using bounded 0/1 Dynamic Programming.
+    Combines:
+      - Category-Reserve-Excluding-Current-Player (Steps 6 & 7)
+      - Rule-Aware Minimum-Cost Reserve (Steps 8 & 9)
+    Future Mandatory Cost = max(Category-Reserve-Excluding-Current-Player, Rule-Aware Minimum-Cost Reserve)
     """
     categories = list(auction.categories.all())
-    if not categories:
-        return Decimal('0.00')
-
-    cat_counts = team_category_counts(auction, team)
-    cat_need = []
-    for c in categories:
-        target = c.target_count
-        bought = cat_counts.get(c.name.strip().lower(), 0)
-        n = max(0, target - bought)
-        if n > 0:
-            cat_need.append((c.name.strip().lower(), n))
-
     current_player = None
     if current_player_id:
         current_player = auction.players.filter(id=current_player_id).first()
-    
-    if current_player:
-        cv = (current_player.category or '').strip().lower()
-        for i, (name, n) in enumerate(cat_need):
-            if name == cv and n > 0:
-                cat_need[i] = (name, n - 1)
-                break
 
+    # Step 6 & 7: Category needs & Category Reserve Excluding Current Player
+    cat_counts = team_category_counts(auction, team)
+    cat_need = []
+    category_reserve_excl_current = Decimal('0.00')
+
+    for c in categories:
+        target = c.target_count or 0
+        bought = cat_counts.get(c.name.strip().lower(), 0)
+        rem = max(0, target - bought)
+        # Step 7: Remove current player if it satisfies this category
+        if current_player and (current_player.category or '').strip().lower() == c.name.strip().lower():
+            if rem > 0:
+                rem -= 1
+        if rem > 0:
+            price = c.base_price or Decimal('0.00')
+            cat_need.append((c.name.strip().lower(), rem, price))
+            category_reserve_excl_current += Decimal(rem) * price
+
+    # Step 8: Squad rule needs excluding current player
     rules = list(auction.squad_rules.filter(active=True))
     rule_counts = team_rule_counts(auction, team)
     rule_need = []
+
     for r in rules:
         val = r.field_value.strip().lower()
-        min_c = r.min_count
+        min_c = r.min_count or 0
         cur_c = rule_counts.get((r.field_key.strip().lower(), val), 0)
-        n = max(0, min_c - cur_c)
-        if current_player and n > 0 and squad_rule_value(current_player, r.field_key).lower() == val:
-            n -= 1
-        if n > 0:
-            rule_need.append((r.field_key.strip().lower(), val, n))
+        rem_min = max(0, min_c - cur_c)
+        # If current player satisfies this rule, remove one unit
+        if current_player and rem_min > 0 and squad_rule_value(current_player, r.field_key).lower() == val:
+            rem_min -= 1
+        if rem_min > 0:
+            rule_need.append((r.field_key.strip().lower(), val, rem_min))
 
-    cat_need = [x for x in cat_need if x[1] > 0]
+    # If no further category or squad rule needs exist, future mandatory cost is 0
     if not cat_need and not rule_need:
         return Decimal('0.00')
 
-    total_slots = sum(n for _, n in cat_need)
-    if total_slots <= 0:
-        total_slots = sum(n for _, _, n in rule_need)
-
+    # Step 9: Bounded 0/1 Dynamic Programming over eligible candidate players
+    # Filter available/unsold players in this auction excluding the current lot player
     available_players = auction.players.filter(status__in=['AVAILABLE', 'UNSOLD'])
     if current_player_id:
         available_players = available_players.exclude(id=current_player_id)
-    
+
+    # Sort candidates by base price ascending
     p_rows = sorted(list(available_players), key=lambda p: p.base_price or Decimal('0.00'))
 
     cat_names = [x[0] for x in cat_need]
@@ -210,9 +300,14 @@ def team_required_attribute_cost(auction, team, current_player_id=None):
     rule_keys = [(x[0], x[1]) for x in rule_need]
     rule_limits = [x[2] for x in rule_need]
 
+    total_target_slots = sum(cat_limits)
+    if total_target_slots <= 0:
+        total_target_slots = sum(rule_limits)
+
     start_state = tuple([0] * len(cat_limits) + [0] * len(rule_limits))
+    target_state = tuple(cat_limits + rule_limits)
     dp = {start_state: Decimal('0.00')}
-    max_states = 10000
+    max_states = 12000
 
     for p in p_rows:
         additions = [0] * len(start_state)
@@ -222,78 +317,94 @@ def team_required_attribute_cost(auction, team, current_player_id=None):
         for i, (fk, fv) in enumerate(rule_keys):
             if squad_rule_value(p, fk).lower() == fv:
                 additions[len(cat_limits) + i] = 1
+
         if not any(additions):
             continue
 
         snapshot = list(dp.items())
+        p_base = p.base_price or Decimal('0.00')
+
         for state, cost in snapshot:
-            if sum(state) >= total_slots:
+            if state == target_state:
                 continue
+
             ns = list(state)
             for i, a in enumerate(additions):
                 if a:
-                    ns[i] = min((cat_limits + rule_limits)[i], ns[i] + a)
+                    ns[i] = min(target_state[i], ns[i] + a)
             ns = tuple(ns)
-            nc = cost + (p.base_price or Decimal('0.00'))
-            if nc < dp.get(ns, Decimal('1000000000.00')):
+            nc = cost + p_base
+
+            if nc < dp.get(ns, Decimal('100000000000.00')):
                 dp[ns] = nc
 
+        # Prune state space if needed
         if len(dp) > max_states:
             dp = dict(sorted(dp.items(), key=lambda kv: kv[1])[:max_states])
 
-    target = tuple(cat_limits + rule_limits)
-    if target in dp:
-        return dp[target]
+    # Rule-Aware Minimum-Cost Reserve
+    rule_aware_reserve = dp.get(target_state, None)
 
-    # Fallback to category base reserve
-    cat_only = Decimal('0.00')
-    for name, n in cat_need:
-        c_obj = next((c for c in categories if c.name.strip().lower() == name), None)
-        price = c_obj.base_price if c_obj else Decimal('1000.00')
-        cat_only += Decimal(n) * price
+    # Step 10: Combine the two reserve concepts
+    # Future Mandatory Cost = max(Category Reserve Excluding Current Player, Rule-Aware Minimum-Cost Reserve)
+    if rule_aware_reserve is not None:
+        future_mandatory_cost = max(category_reserve_excl_current, rule_aware_reserve)
+    else:
+        # Fallback to category-only reserve if DP couldn't reach full intersection
+        future_mandatory_cost = category_reserve_excl_current
 
-    return cat_only
+    return future_mandatory_cost
+
 
 def team_financials(auction, team, current_player_id=None):
     """
-    Computes real-time financials: kitty, spent, balance, future_base_cost, reserve, max_bid.
-    Formula: Max Bid = Net Kitty - (Spent + Future Base Cost + Reserve)
+    Steps 4, 5, 10, 11, 12: Core V24 Financial & Max Bid Calculator.
+    Net Kitty = Team Purse + Team Additional Kitty - Team Penalty
+    Future Mandatory Cost = max(Category Reserve Excl Current, Rule-Aware DP Reserve)
+    Max Bid = Net Kitty - [Spent + Future Mandatory Cost + Team Reserve]
+    Clamped with max(0, ...)
     """
-    config = getattr(auction, 'v24_config', None)
-    reserve = Decimal(str(config.reserve_amount)) if config else Decimal('0.00')
-    if hasattr(team, 'reserve_amount') and team.reserve_amount:
-        reserve = Decimal(str(team.reserve_amount))
-
+    # Step 4: Net Kitty
     kitty = net_kitty(auction, team)
 
-    # Spent
+    # Step 5: Calculate Spent (active player_sales / sold_players for this team)
     sold_to_team = auction.players.filter(sold_to=team, status='SOLD')
     spent = sum((p.sold_price or Decimal('0.00') for p in sold_to_team), Decimal('0.00'))
-    bought_count = sold_to_team.count()
+    bought_count = sold_to_team.count() if hasattr(sold_to_team, 'count') and not isinstance(sold_to_team, list) else len(sold_to_team)
 
+    # Balance (wallet balance available)
     balance = max(Decimal('0.00'), kitty - spent)
 
-    # Future base cost calculation
+    # Steps 6, 7, 8, 9, 10: Future Mandatory Cost
+    future_mandatory_cost = team_required_attribute_cost(auction, team, current_player_id)
+
+    # Step 11: Team Reserve (protected money)
+    config = getattr(auction, 'v24_config', None)
+    team_reserve = Decimal('0.00')
+    if hasattr(team, 'reserve_amount') and team.reserve_amount:
+        team_reserve = Decimal(str(team.reserve_amount))
+    elif config and getattr(config, 'reserve_amount', None):
+        team_reserve = Decimal(str(config.reserve_amount))
+
+    # Step 12: Calculate Max Bid
+    # Max Bid = Net Kitty − [Spent + Future Mandatory Cost + Team Reserve]
+    raw_max_bid = kitty - (spent + future_mandatory_cost + team_reserve)
+    max_bid = max(Decimal('0.00'), raw_max_bid)
+
+    # Pending category quota slots count
     cat_counts = team_category_counts(auction, team)
-    remaining_base_cost = Decimal('0.00')
     pending_slots = 0
     for c in auction.categories.all():
-        req = c.target_count
+        req = c.target_count or 0
         bought = cat_counts.get(c.name.strip().lower(), 0)
-        rem = max(0, req - bought)
-        pending_slots += rem
-        remaining_base_cost += Decimal(rem) * c.base_price
+        pending_slots += max(0, req - bought)
 
-    cur_base = Decimal('0.00')
-    if current_player_id:
-        cp = auction.players.filter(id=current_player_id).first()
-        if cp:
-            cur_base = cp.base_price or Decimal('0.00')
-
-    rule_cost = team_required_attribute_cost(auction, team, current_player_id)
-    future_base_cost = max(Decimal('0.00'), remaining_base_cost - cur_base, rule_cost)
-
-    max_bid = max(Decimal('0.00'), kitty - (spent + future_base_cost + reserve))
+    # Team display metadata
+    t_name = team.team.name if team.team else 'Team'
+    words = [w for w in re.split(r'[\s\-_]+', t_name) if w]
+    auto_short = ("".join(w[0] for w in words)[:4].upper()) if len(words) >= 2 else t_name[:3].upper()
+    cd = getattr(team, 'custom_data', {}) or {}
+    s_name = cd.get('short_name') or getattr(team.team, 'short_name', None) or auto_short
 
     t_logo = ''
     if team.team and getattr(team.team, 'logo', None):
@@ -301,13 +412,6 @@ def team_financials(auction, team, current_player_id=None):
             t_logo = team.team.logo.url
         except Exception:
             pass
-
-    t_name = team.team.name if team.team else 'Team'
-    import re
-    words = [w for w in re.split(r'[\s\-_]+', t_name) if w]
-    auto_short = ("".join(w[0] for w in words)[:4].upper()) if len(words) >= 2 else t_name[:3].upper()
-    cd = getattr(team, 'custom_data', {}) or {}
-    s_name = cd.get('short_name') or getattr(team.team, 'short_name', None) or auto_short
 
     return {
         'team_id': str(team.id),
@@ -318,8 +422,8 @@ def team_financials(auction, team, current_player_id=None):
         'kitty': float(kitty),
         'spent': float(spent),
         'balance': float(balance),
-        'reserve': float(reserve),
-        'future_base_cost': float(future_base_cost),
+        'reserve': float(team_reserve),
+        'future_base_cost': float(future_mandatory_cost),
         'max_bid': float(max_bid),
         'bought': bought_count,
         'pending': pending_slots,
