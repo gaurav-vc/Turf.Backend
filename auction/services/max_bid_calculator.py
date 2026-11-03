@@ -234,6 +234,40 @@ def valid_custom_bid(auction, current_bid, amount, base_price):
     return False, inc, f"Enter a bid above ₹{current_bid:,.0f} in multiples of ₹{inc:,.0f}."
 
 
+def get_ordered_categories(auction):
+    """
+    Returns categories ordered according to the tournament's configured category sequence,
+    falling back to priority and display_order.
+    """
+    config = getattr(auction, 'v24_config', None)
+    categories = list(auction.categories.all())
+    if not categories:
+        return []
+
+    if config and getattr(config, 'category_sequence', None):
+        seq = config.category_sequence
+        if isinstance(seq, list) and len(seq) > 0:
+            cat_map = {c.name.strip().lower(): c for c in categories}
+            ordered = []
+            for name in seq:
+                nm = str(name).strip().lower()
+                if nm in cat_map:
+                    ordered.append(cat_map[nm])
+            for c in categories:
+                if c not in ordered:
+                    ordered.append(c)
+            return ordered
+
+    def sort_key(c):
+        p = getattr(c, 'priority', 1)
+        p_val = int(p) if isinstance(p, (int, float)) else 1
+        d = getattr(c, 'display_order', 1)
+        d_val = int(d) if isinstance(d, (int, float)) else 1
+        return (p_val, d_val, str(getattr(c, 'id', '')))
+
+    return sorted(categories, key=sort_key)
+
+
 def team_required_attribute_cost(auction, team, current_player_id=None):
     """
     Steps 6, 7, 8, 9, 10:
@@ -242,28 +276,79 @@ def team_required_attribute_cost(auction, team, current_player_id=None):
       - Category-Reserve-Excluding-Current-Player (Steps 6 & 7)
       - Rule-Aware Minimum-Cost Reserve (Steps 8 & 9)
     Future Mandatory Cost = max(Category-Reserve-Excluding-Current-Player, Rule-Aware Minimum-Cost Reserve)
+
+    Sequence Rule:
+      - If current_player is on block and team still needs player(s) in current_player's category:
+        deduct 1 unit from current_player.category.
+      - If current_player is on block but team already bought the required number for that category:
+        consider the base price of the NEXT to be auctioned category in sequence that this team still needs!
+      - If no player is on the block (pre-auction or between lots):
+        consider the base price of the FIRST category in sequence that this team still needs!
     """
-    categories = list(auction.categories.all())
+    ordered_categories = get_ordered_categories(auction)
     current_player = None
     if current_player_id:
         current_player = auction.players.filter(id=current_player_id).first()
 
     # Step 6 & 7: Category needs & Category Reserve Excluding Current Player
     cat_counts = team_category_counts(auction, team)
+    cat_rem = {}
+    for c in ordered_categories:
+        c_name = c.name.strip().lower()
+        target = c.target_count or 0
+        bought = cat_counts.get(c_name, 0)
+        cat_rem[c_name] = max(0, target - bought)
+
+    # Determine which category to deduct 1 unit from (current / next in sequence to be bought)
+    deduct_cat_name = None
+    if current_player:
+        cp_cat = (current_player.category or '').strip().lower()
+        if cat_rem.get(cp_cat, 0) > 0:
+            # Case 1: Team still needs player(s) in current player's category
+            deduct_cat_name = cp_cat
+        else:
+            # Case 2: Team already completed current category quota.
+            # Look forward in the sequence for the NEXT category this team still needs!
+            cp_idx = -1
+            for idx, c in enumerate(ordered_categories):
+                if c.name.strip().lower() == cp_cat:
+                    cp_idx = idx
+                    break
+            candidates_forward = ordered_categories[cp_idx + 1:] if cp_idx >= 0 else []
+            for c in candidates_forward:
+                c_name = c.name.strip().lower()
+                if cat_rem.get(c_name, 0) > 0:
+                    deduct_cat_name = c_name
+                    break
+            # If none found forward, search from beginning of sequence
+            if not deduct_cat_name:
+                for c in ordered_categories:
+                    c_name = c.name.strip().lower()
+                    if cat_rem.get(c_name, 0) > 0:
+                        deduct_cat_name = c_name
+                        break
+    else:
+        # Case 3: Pre-auction or between lots (no current lot).
+        # Consider the FIRST category in sequence that this team still needs!
+        for c in ordered_categories:
+            c_name = c.name.strip().lower()
+            if cat_rem.get(c_name, 0) > 0:
+                deduct_cat_name = c_name
+                break
+
+    # Apply 1-player deduction from the determined category
+    if deduct_cat_name and cat_rem.get(deduct_cat_name, 0) > 0:
+        cat_rem[deduct_cat_name] -= 1
+
+    # Build cat_need and calculate Category-Reserve-Excluding-Current-Player
     cat_need = []
     category_reserve_excl_current = Decimal('0.00')
-
-    for c in categories:
-        target = c.target_count or 0
-        bought = cat_counts.get(c.name.strip().lower(), 0)
-        rem = max(0, target - bought)
-        # Step 7: Remove current player if it satisfies this category
-        if current_player and (current_player.category or '').strip().lower() == c.name.strip().lower():
-            if rem > 0:
-                rem -= 1
+    for c in ordered_categories:
+        c_name = c.name.strip().lower()
+        rem = cat_rem.get(c_name, 0)
+        price = c.base_price or Decimal('0.00')
         if rem > 0:
-            price = c.base_price or Decimal('0.00')
-            cat_need.append((c.name.strip().lower(), rem, price))
+            cat_need.append((c_name, rem, price))
             category_reserve_excl_current += Decimal(rem) * price
 
     # Step 8: Squad rule needs excluding current player
@@ -285,12 +370,17 @@ def team_required_attribute_cost(auction, team, current_player_id=None):
     # If no further category or squad rule needs exist, future mandatory cost is 0
     if not cat_need and not rule_need:
         return Decimal('0.00')
+    if not cat_need and not rule_need:
+        return Decimal('0.00')
 
     # Step 9: Bounded 0/1 Dynamic Programming over eligible candidate players
     # Filter available/unsold players in this auction excluding the current lot player
     available_players = auction.players.filter(status__in=['AVAILABLE', 'UNSOLD'])
     if current_player_id:
-        available_players = available_players.exclude(id=current_player_id)
+        if hasattr(available_players, 'exclude'):
+            available_players = available_players.exclude(id=current_player_id)
+        else:
+            available_players = [p for p in available_players if getattr(p, 'id', None) != current_player_id]
 
     # Sort candidates by base price ascending
     p_rows = sorted(list(available_players), key=lambda p: p.base_price or Decimal('0.00'))
