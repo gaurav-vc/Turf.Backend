@@ -472,10 +472,12 @@ class LiveAuctionEngine:
         order_fields = ['serial_no', 'created_at', 'id'] if lot_order == 'sequential' else ['?']
 
         player = None
-        if category and category.strip() and category.upper() != 'ALL':
+        is_open_mode = not category or not str(category).strip() or str(category).strip().upper() in ['ALL', 'OPEN', 'DEFAULT', 'ANY']
+        if not is_open_mode:
             qs = auction.players.filter(status__in=['AVAILABLE', 'PENDING'], category__iexact=category.strip())
             player = qs.order_by(*order_fields).first()
-        else:
+
+        if not player:
             # Respect category priority order configured in Master Setup & Rules
             cat_names = list(AuctionCategory.objects.filter(auction=auction).order_by('priority', 'display_order', 'created_at').values_list('name', flat=True))
             for cat_name in cat_names:
@@ -490,10 +492,10 @@ class LiveAuctionEngine:
             # Fallback check for UNSOLD if bring_back_unsold is enabled
             bring_back = config.bring_back_unsold if config else True
             if bring_back:
-                if category and category.strip() and category.upper() != 'ALL':
+                if not is_open_mode:
                     unsold_qs = auction.players.filter(status='UNSOLD', category__iexact=category.strip())
                     player = unsold_qs.order_by(*order_fields).first()
-                else:
+                if not player:
                     cat_names = list(AuctionCategory.objects.filter(auction=auction).order_by('priority', 'display_order', 'created_at').values_list('name', flat=True))
                     for cat_name in cat_names:
                         cat_qs = auction.players.filter(status='UNSOLD', category__iexact=cat_name).order_by(*order_fields)
@@ -504,9 +506,7 @@ class LiveAuctionEngine:
                         player = auction.players.filter(status='UNSOLD').order_by(*order_fields).first()
 
         if not player:
-            if category and category.strip() and category.upper() != 'ALL':
-                return False, f"No available players found in category '{category}'."
-            return False, "No available players remaining in the auction pool."
+            return False, "No available or unsold players remaining in the auction pool."
 
         with transaction.atomic():
             if auction.active_player and auction.active_player.id != player.id:

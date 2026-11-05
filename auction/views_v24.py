@@ -282,13 +282,25 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
         """Returns the upcoming queue of players for auto-advance or queue preview."""
         auction = self._get_auction(pk)
         category = request.query_params.get('category')
-        qs = auction.players.filter(status__in=['AVAILABLE', 'PENDING'])
-        if category and category.strip() and category.upper() != 'ALL':
-            qs = qs.filter(category__iexact=category.strip())
-        
+        all_pending_qs = auction.players.filter(status__in=['AVAILABLE', 'PENDING'])
+        total_in_auction = all_pending_qs.count()
+
+        is_open_or_all = not category or not category.strip() or category.strip().upper() in ['ALL', 'OPEN', 'DEFAULT', 'ANY']
+        if is_open_or_all:
+            qs = all_pending_qs
+            cat_count = total_in_auction
+        else:
+            filtered_qs = all_pending_qs.filter(category__iexact=category.strip())
+            cat_count = filtered_qs.count()
+            if cat_count > 0:
+                qs = filtered_qs
+            else:
+                # If specific category has 0 available players, don't return an empty queue if auction has players
+                qs = all_pending_qs
+
         # Respect category priority order
         cat_order = list(AuctionCategory.objects.filter(auction=auction).order_by('priority', 'display_order', 'created_at').values_list('name', flat=True))
-        
+
         queued_players = list(qs.order_by('serial_no', 'created_at', 'id')[:10])
         results = []
         for p in queued_players:
@@ -315,10 +327,16 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             })
 
         config = getattr(auction, 'v24_config', None)
+        unsold_count = auction.players.filter(status='UNSOLD').count()
         return Response({
             'success': True,
             'queue': results,
-            'total_pending': qs.count(),
+            'total_pending': cat_count,
+            'total_remaining_in_category': cat_count,
+            'total_remaining_in_auction': total_in_auction,
+            'unsold_count': unsold_count,
+            'category_has_remaining': cat_count > 0,
+            'auction_has_remaining': total_in_auction > 0,
             'auto_advance_queue': getattr(config, 'auto_advance_queue', True) if config else True,
             'allow_multiple_bids': getattr(config, 'allow_multiple_bids', False) if config else False,
         })

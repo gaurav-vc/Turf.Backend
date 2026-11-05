@@ -503,11 +503,14 @@ def team_financials(auction, team, current_player_id=None):
         except Exception:
             pass
 
+    t_color = cd.get('color') or cd.get('team_color') or (team.team.logo_color if team.team and getattr(team.team, 'logo_color', None) else None) or getattr(team, 'color', None) or '#3b82f6'
+
     return {
         'team_id': str(team.id),
         'team_name': t_name,
         'short_name': s_name,
-        'team_color': getattr(team.team, 'logo_color', '#3b82f6') if team.team else '#3b82f6',
+        'team_color': t_color,
+        'color': t_color,
         'team_logo': t_logo,
         'kitty': float(kitty),
         'spent': float(spent),
@@ -518,4 +521,5 @@ def team_financials(auction, team, current_player_id=None):
         'bought': bought_count,
         'pending': pending_slots,
         'category_counts': cat_counts,
+        'max_squad': int(getattr(config, 'max_squad', 0) or 0) if config else 0,
     }
