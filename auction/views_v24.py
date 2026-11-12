@@ -629,6 +629,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                     'team_id': str(t.id) if t else '',
                     'name': t.name if t else 'Unnamed Team',
                     'short_name': at.custom_data.get('short_name', (t.name[:3].upper() if t and t.name else 'TM')),
+                    'shortcut_key': at.custom_data.get('shortcut_key', ''),
                     'color': t.logo_color if t and t.logo_color else '#2563eb',
                     'logo': logo_val,
                     'logo_url': at.custom_data.get('logo_url', ''),
@@ -660,6 +661,25 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
 
         name = str(name).strip()
         short_name = str(request.data.get('short_name') or name[:3]).strip().upper()[:3]
+        shortcut_key = str(request.data.get('shortcut_key') or '').strip().upper()[:1]
+        override_shortcut = request.data.get('override_shortcut') in [True, 'true', 'True', 1, '1']
+
+        if shortcut_key:
+            for other_at in auction.teams.all():
+                if (other_at.custom_data or {}).get('shortcut_key', '').upper() == shortcut_key:
+                    if override_shortcut:
+                        other_cd = other_at.custom_data or {}
+                        other_cd['shortcut_key'] = ''
+                        other_at.custom_data = other_cd
+                        other_at.save(update_fields=['custom_data'])
+                    else:
+                        other_name = other_at.team.name if other_at.team else 'Another Team'
+                        return Response({
+                            'error': f'Key already assigned to Team "{other_name}". Would you like to override it?',
+                            'conflict_team': other_name,
+                            'conflict_key': shortcut_key,
+                            'requires_override_confirmation': True
+                        }, status=status.HTTP_409_CONFLICT)
         owner_name = str(request.data.get('owner_name') or '').strip()
         owner_email = str(request.data.get('owner_email') or '').strip()
         owner_mobile = str(request.data.get('owner_mobile') or '').strip()
@@ -744,6 +764,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
         # Create AuctionTeam
         custom_data = {
             'short_name': short_name,
+            'shortcut_key': shortcut_key,
             'owner_name': owner_name,
             'owner_email': owner_email,
             'owner_mobile': owner_mobile,
@@ -831,6 +852,26 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
 
         # Update financials and custom data
         custom = auc_team.custom_data or {}
+        if 'shortcut_key' in data:
+            sk = str(data.get('shortcut_key') or '').strip().upper()[:1]
+            override_sk = data.get('override_shortcut') in [True, 'true', 'True', 1, '1']
+            if sk:
+                for other_at in auction.teams.exclude(pk=auc_team.id):
+                    if (other_at.custom_data or {}).get('shortcut_key', '').upper() == sk:
+                        if override_sk:
+                            other_cd = other_at.custom_data or {}
+                            other_cd['shortcut_key'] = ''
+                            other_at.custom_data = other_cd
+                            other_at.save(update_fields=['custom_data'])
+                        else:
+                            other_name = other_at.team.name if other_at.team else 'Another Team'
+                            return Response({
+                                'error': f'Key already assigned to Team "{other_name}". Would you like to override it?',
+                                'conflict_team': other_name,
+                                'conflict_key': sk,
+                                'requires_override_confirmation': True
+                            }, status=status.HTTP_409_CONFLICT)
+            custom['shortcut_key'] = sk
         for k in ['short_name', 'owner_name', 'owner_email', 'owner_mobile',
                   'manager_name', 'manager_email', 'manager_mobile', 'sponsor_name', 'logo_url']:
             if k in data:
@@ -878,6 +919,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 'id': str(auc_team.id),
                 'name': t.name,
                 'short_name': custom.get('short_name', t.name[:3].upper()),
+                'shortcut_key': custom.get('shortcut_key', ''),
                 'color': t.logo_color,
                 'logo': logo_val,
                 'logo_url': custom.get('logo_url', ''),

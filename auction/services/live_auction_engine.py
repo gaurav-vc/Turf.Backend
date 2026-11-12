@@ -125,6 +125,27 @@ class LiveAuctionEngine:
         config = getattr(auction, 'v24_config', None)
         design = getattr(auction, 'page_design', None)
 
+        all_players_qs = auction.players.select_related('player', 'sold_to__team').order_by('serial_no')
+        players_summary = []
+        for ap in all_players_qs:
+            players_summary.append({
+                'id': str(ap.id),
+                'player_name': ap.player.full_name or ap.player.first_name if ap.player else 'Player',
+                'serial_no': ap.serial_no or 0,
+                'category': ap.category or 'General',
+                'role': ap.role or 'All-Rounder',
+                'base_price': float(ap.base_price or 0),
+                'sold_price': float(ap.sold_price or 0),
+                'status': ap.status,
+                'sold_to_id': str(ap.sold_to.id) if ap.sold_to else None,
+                'sold_to_name': ap.sold_to.team.name if ap.sold_to and ap.sold_to.team else '',
+                'photo_url': ap.photo_url or '',
+                'batting_style': ap.batting_style or '',
+                'bowling_style': ap.bowling_style or '',
+            })
+
+        categories_list = list(auction.categories.values_list('name', flat=True))
+
         return {
             'auction_id': str(auction.id),
             'auction_name': auction.name,
@@ -132,6 +153,8 @@ class LiveAuctionEngine:
             'active_player': player_data,
             'preview_player': preview_player,
             'recent_player': recent_player,
+            'players_summary': players_summary,
+            'categories': categories_list,
             'stats': {
                 'total_players': total_players,
                 'sold_count': sold_count,
@@ -162,6 +185,9 @@ class LiveAuctionEngine:
                 'auto_advance_queue': getattr(config, 'auto_advance_queue', True) if config else True,
                 'custom_messages': getattr(config, 'custom_messages', {}) if config else {},
                 'lot_order': getattr(config, 'lot_order', 'random') if config else 'random',
+                'auction_background': getattr(config, 'auction_background', '') if config else '',
+                'overall_background': getattr(config, 'overall_background', '') if config else '',
+                'tournament_logo': getattr(config, 'tournament_logo', '') if config else '',
             } if config else {},
             'design': design.design_json if design else {},
         }

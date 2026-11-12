@@ -509,6 +509,7 @@ def team_financials(auction, team, current_player_id=None):
         'team_id': str(team.id),
         'team_name': t_name,
         'short_name': s_name,
+        'shortcut_key': cd.get('shortcut_key', ''),
         'team_color': t_color,
         'color': t_color,
         'team_logo': t_logo,
