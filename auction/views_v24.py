@@ -3240,6 +3240,81 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
         if request.method == 'POST':
             data = request.data
 
+            # 0. Tournament Name & Name Branding (Synchronized across Master Setup, Designer, and Live Screen)
+            tournament_name = data.get('tournament_name') or data.get('title_text') or data.get('name')
+            if tournament_name and str(tournament_name).strip():
+                clean_name = str(tournament_name).strip()
+                auction.name = clean_name
+                auction.save(update_fields=['name'])
+                if 'zones' not in design_json:
+                    design_json['zones'] = {}
+                if 'branding' not in design_json['zones']:
+                    design_json['zones']['branding'] = {}
+                design_json['zones']['branding']['title_text'] = clean_name
+
+            if 'title_colour' in data or 'title_color' in data:
+                tc = str(data.get('title_colour') or data.get('title_color')).strip()
+                if tc:
+                    if 'zones' not in design_json:
+                        design_json['zones'] = {}
+                    if 'branding' not in design_json['zones']:
+                        design_json['zones']['branding'] = {}
+                    design_json['zones']['branding']['title_colour'] = tc
+
+            if 'title_size' in data:
+                try:
+                    ts = int(data['title_size'])
+                    if 'zones' not in design_json:
+                        design_json['zones'] = {}
+                    if 'branding' not in design_json['zones']:
+                        design_json['zones']['branding'] = {}
+                    design_json['zones']['branding']['title_size'] = ts
+                except (ValueError, TypeError):
+                    pass
+
+            if 'logo_position' in data:
+                lp = str(data['logo_position']).strip().lower()
+                if lp in ['left', 'center', 'right']:
+                    if 'zones' not in design_json:
+                        design_json['zones'] = {}
+                    if 'branding' not in design_json['zones']:
+                        design_json['zones']['branding'] = {}
+                    design_json['zones']['branding']['logo_position'] = lp
+
+            if 'logo_size' in data:
+                try:
+                    ls = int(data['logo_size'])
+                    if 'zones' not in design_json:
+                        design_json['zones'] = {}
+                    if 'branding' not in design_json['zones']:
+                        design_json['zones']['branding'] = {}
+                    design_json['zones']['branding']['logo_size'] = ls
+                except (ValueError, TypeError):
+                    pass
+
+            if 'title_image' in request.FILES:
+                ti_file = request.FILES['title_image']
+                rem_ti_bg = str(data.get('remove_title_bg', '')).lower() in ['true', '1', 'on']
+                try:
+                    res = AssetManagerService.save_and_process_asset(
+                        str(auction.id), ti_file, 'Tournament Title Banner', 'Banner', rem_ti_bg
+                    )
+                    ti_url = res.get('processed_url') or res.get('original_url')
+                    if 'zones' not in design_json:
+                        design_json['zones'] = {}
+                    if 'branding' not in design_json['zones']:
+                        design_json['zones']['branding'] = {}
+                    design_json['zones']['branding']['title_image_url'] = ti_url
+                    design_json['zones']['branding']['remove_title_bg'] = rem_ti_bg
+                except Exception as e:
+                    print("Title image upload error:", e)
+            elif 'title_image_url' in data:
+                if 'zones' not in design_json:
+                    design_json['zones'] = {}
+                if 'branding' not in design_json['zones']:
+                    design_json['zones']['branding'] = {}
+                design_json['zones']['branding']['title_image_url'] = str(data.get('title_image_url', '')).strip()
+
             # 1. Auction Completion
             completion_msg = data.get('auction_completion_message') or data.get('completion_message')
             if completion_msg is not None:
@@ -3620,6 +3695,22 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
         if not seq:
             seq = [c['name'] for c in categories]
 
+        branding_zone = design_json.get('zones', {}).get('branding', {})
+        branding_data = {
+            'tournament_name': branding_zone.get('title_text') or auction.name,
+            'title_text': branding_zone.get('title_text') or auction.name,
+            'title_colour': branding_zone.get('title_colour', '#FFD54A'),
+            'title_size': branding_zone.get('title_size', 26),
+            'title_image_url': branding_zone.get('title_image_url', ''),
+            'remove_title_bg': branding_zone.get('remove_title_bg', False),
+            'logo_position': branding_zone.get('logo_position', 'left'),
+            'logo_size': branding_zone.get('logo_size', 34),
+            'tournament_logo': config.tournament_logo or '',
+            'remove_tournament_logo_bg': branding_zone.get('remove_title_bg', False),
+            'auction_background': config.auction_background or 'stadium',
+            'overall_background': config.overall_background or 'default',
+        }
+
         return Response({
             'success': True,
             'auction': {
@@ -3628,7 +3719,16 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 'team_purse': float(auction.base_budget),
                 'active_teams_count': active_teams_count,
             },
+            'branding': branding_data,
             'config': {
+                'tournament_name': branding_zone.get('title_text') or auction.name,
+                'title_text': branding_zone.get('title_text') or auction.name,
+                'title_colour': branding_zone.get('title_colour', '#FFD54A'),
+                'title_size': branding_zone.get('title_size', 26),
+                'title_image_url': branding_zone.get('title_image_url', ''),
+                'remove_title_bg': branding_zone.get('remove_title_bg', False),
+                'logo_position': branding_zone.get('logo_position', 'left'),
+                'logo_size': branding_zone.get('logo_size', 34),
                 'auction_completion_message': config.completion_message or 'Auction Completed - All team are now completed',
                 'auction_mode': extended.get('auction_mode', 'Centralized'),
                 'player_selection_mode': 'Category Wise' if config.category_wise_bidding else 'Open',
