@@ -41,7 +41,9 @@ class LiveAuctionEngine:
                     except Exception:
                         t_logo = ""
                 if not t_logo and b.team and getattr(b.team, 'custom_data', None):
-                    t_logo = b.team.custom_data.get('logo_url', '')
+                    t_logo = b.team.custom_data.get('logo_url', '') or b.team.custom_data.get('logo', '')
+                if not t_logo and b.team and b.team.team and getattr(b.team.team, 'customization', None):
+                    t_logo = (b.team.team.customization or {}).get('logo_url', '')
                 bids_history.append({
                     'id': str(b.id),
                     'amount': float(b.amount),

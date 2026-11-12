@@ -40,13 +40,21 @@ class AuctionTeamSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
     def get_team_logo(self, obj):
+        request = self.context.get('request')
         if obj.team and getattr(obj.team, 'logo', None):
             try:
-                request = self.context.get('request')
                 url = obj.team.logo.url
                 return request.build_absolute_uri(url) if request else url
             except Exception:
-                return None
+                pass
+        cd = getattr(obj, 'custom_data', {}) or {}
+        logo_url = cd.get('logo_url') or cd.get('logo')
+        if not logo_url and obj.team and getattr(obj.team, 'customization', None):
+            logo_url = (obj.team.customization or {}).get('logo_url')
+        if logo_url:
+            if request and not (str(logo_url).startswith('http://') or str(logo_url).startswith('https://')):
+                return request.build_absolute_uri(logo_url)
+            return logo_url
         return None
 
     def get_captain_name(self, obj):

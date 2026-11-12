@@ -501,7 +501,11 @@ def team_financials(auction, team, current_player_id=None):
         try:
             t_logo = team.team.logo.url
         except Exception:
-            pass
+            t_logo = str(team.team.logo)
+    if not t_logo and cd:
+        t_logo = cd.get('logo_url') or cd.get('logo') or ''
+    if not t_logo and team.team and getattr(team.team, 'customization', None):
+        t_logo = (team.team.customization or {}).get('logo_url') or ''
 
     t_color = cd.get('color') or cd.get('team_color') or (team.team.logo_color if team.team and getattr(team.team, 'logo_color', None) else None) or getattr(team, 'color', None) or '#3b82f6'
 
@@ -513,6 +517,8 @@ def team_financials(auction, team, current_player_id=None):
         'team_color': t_color,
         'color': t_color,
         'team_logo': t_logo,
+        'logo': t_logo,
+        'logo_url': cd.get('logo_url', '') if cd else '',
         'kitty': float(kitty),
         'spent': float(spent),
         'balance': float(balance),
