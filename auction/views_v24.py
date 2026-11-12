@@ -742,6 +742,20 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
 
         # Create sports.models.Team
         logo_file = request.FILES.get('logo') or request.FILES.get('team_logo')
+        logo_base64 = request.data.get('logo_base64') or request.data.get('logo_data_url')
+        if not logo_file and logo_base64 and str(logo_base64).startswith('data:image/'):
+            try:
+                import base64
+                from django.core.files.base import ContentFile
+                fmt, imgstr = str(logo_base64).split(';base64,')
+                ext = fmt.split('/')[-1]
+                if ext == 'jpeg':
+                    ext = 'jpg'
+                fname = f"team_{uuid.uuid4().hex[:8]}.{ext}"
+                logo_file = ContentFile(base64.b64decode(imgstr), name=fname)
+            except Exception as e:
+                logger.warning(f"Failed to decode logo_base64: {e}")
+
         team_obj = Team.objects.create(
             user=owner_user,
             sport=sport,
@@ -845,6 +859,20 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 t.logo_color = str(c)
 
         logo_file = request.FILES.get('logo') or request.FILES.get('team_logo')
+        logo_base64 = request.data.get('logo_base64') or request.data.get('logo_data_url')
+        if not logo_file and logo_base64 and str(logo_base64).startswith('data:image/'):
+            try:
+                import base64
+                from django.core.files.base import ContentFile
+                fmt, imgstr = str(logo_base64).split(';base64,')
+                ext = fmt.split('/')[-1]
+                if ext == 'jpeg':
+                    ext = 'jpg'
+                fname = f"team_{t.id}_{uuid.uuid4().hex[:6]}.{ext}"
+                logo_file = ContentFile(base64.b64decode(imgstr), name=fname)
+            except Exception as e:
+                logger.warning(f"Failed to decode logo_base64 in patch: {e}")
+
         if logo_file:
             t.logo = logo_file
 
