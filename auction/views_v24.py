@@ -1982,7 +1982,9 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                         })
                         cfg_el = cfg_elements.get(el_key, {})
                         el = {**def_cfg, **cfg_el}
-                        if not el.get('selected', True):
+                        # Strictly skip unselected / turned-off boxes
+                        is_sel = el.get('selected')
+                        if is_sel is False or is_sel == 'false' or is_sel == 0 or is_sel == '0':
                             continue
 
                         el_x = cx + (float(el.get('x', 0)) / 100.0) * cw
@@ -2006,26 +2008,64 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                         ]:
                             custom_override = None
 
-                        custom_lbl = el.get('label')
+                        # Determine whether label prefix should be shown
+                        raw_show_lbl = el.get('show_label')
+                        if raw_show_lbl is False or raw_show_lbl == 'false' or raw_show_lbl == 0 or raw_show_lbl == '0':
+                            show_label = False
+                        elif raw_show_lbl is True or raw_show_lbl == 'true' or raw_show_lbl == 1 or raw_show_lbl == '1':
+                            show_label = True
+                        else:
+                            show_label = bool(def_cfg.get('show_label', False))
+
+                        custom_lbl = str(el.get('label') or '').strip()
+                        def_lbl = str(def_cfg.get('label') or '').strip()
+                        label_name = custom_lbl if custom_lbl else def_lbl
+                        if label_name and not label_name.endswith(':') and not label_name.endswith(' '):
+                            label_name = f"{label_name}:"
+                        prefix_lbl = f"{label_name} " if (show_label and label_name) else ""
+
                         c_r, c_g, c_b = hex_to_rgb(el.get('colour', '#0f172a'))
                         f_sz = max(6.0, min(14.0, float(el.get('font_size', 9.5)) * 0.72))
                         font_choice = '/F2' if el.get('bold', False) else '/F1'
 
                         if el_key == 'player_photo':
-                            cmds.append(f"0.93 0.95 0.97 rg 0.78 0.82 0.88 RG 0.5 w {el_x:.1f} {el_y_bottom:.1f} {el_w:.1f} {el_h:.1f} re B")
-                            ph_tx = el_x + max(2.0, (el_w - 28.0) / 2.0)
-                            ph_ty = el_y_bottom + (el_h / 2.0) - 3.0
-                            cmds.append(f"BT /F2 8.5 Tf 0.45 0.50 0.60 rg {ph_tx:.1f} {ph_ty:.1f} Td (PHOTO) Tj ET")
+                            p_user = getattr(p, 'player', None)
+                            raw_p_photo = (
+                                getattr(p, 'photo_url', None) or
+                                getattr(p, 'photo', None) or
+                                (getattr(p_user, 'photo', None) if p_user else None)
+                            )
+                            if hasattr(raw_p_photo, 'url'):
+                                raw_p_photo = raw_p_photo.url
+
+                            p_img_ref = None
+                            if raw_p_photo:
+                                p_img_ref = f"/ImP_{idx}_{getattr(p, 'id', idx)}"
+                                if p_img_ref not in images_dict:
+                                    p_img_info = self._process_image_to_jpeg_dict(str(raw_p_photo))
+                                    if p_img_info:
+                                        images_dict[p_img_ref] = p_img_info
+                                    else:
+                                        p_img_ref = None
+
+                            if p_img_ref and p_img_ref in images_dict:
+                                cmds.append(f"q {el_w:.2f} 0 0 {el_h:.2f} {el_x:.2f} {el_y_bottom:.2f} cm {p_img_ref} Do Q")
+                                cmds.append(f"0.78 0.82 0.88 RG 0.5 w {el_x:.1f} {el_y_bottom:.1f} {el_w:.1f} {el_h:.1f} re S")
+                            else:
+                                cmds.append(f"0.93 0.95 0.97 rg 0.78 0.82 0.88 RG 0.5 w {el_x:.1f} {el_y_bottom:.1f} {el_w:.1f} {el_h:.1f} re B")
+                                ph_tx = el_x + max(2.0, (el_w - 28.0) / 2.0)
+                                ph_ty = el_y_bottom + (el_h / 2.0) - 3.0
+                                cmds.append(f"BT /F2 8.5 Tf 0.45 0.50 0.60 rg {ph_tx:.1f} {ph_ty:.1f} Td (PHOTO) Tj ET")
 
                         elif el_key == 'player_number':
-                            lbl = (custom_lbl + ' ') if custom_lbl else ('No: ' if el.get('show_label', False) else '#')
+                            lbl = prefix_lbl if show_label else '#'
                             val_text = f"{lbl}{serial}" if custom_override is None else f"{lbl}{custom_override}"
                             f_sz = max(8.0, min(12.0, float(el.get('font_size', 13)) * 0.75))
                             ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
                             cmds.append(f"BT /F2 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)}) Tj ET")
 
                         elif el_key == 'category':
-                            lbl = (custom_lbl + ' ') if custom_lbl else ('Cat: ' if el.get('show_label', False) else '')
+                            lbl = prefix_lbl
                             val_text = f"[{lbl}{cat}]" if custom_override is None else f"[{lbl}{custom_override}]"
                             f_sz = max(7.0, min(10.0, float(el.get('font_size', 10)) * 0.72))
                             ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
@@ -2034,22 +2074,31 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                             cmds.append(f"BT /F2 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {tx:.1f} {ty:.1f} Td ({esc(val_text)}) Tj ET")
 
                         elif el_key == 'name':
-                            lbl = (custom_lbl + ' ') if custom_lbl else ('Name: ' if el.get('show_label', False) else '')
-                            val_text = f"{lbl}{name}" if custom_override is None else f"{lbl}{custom_override}"
-                            f_sz = max(9.0, min(13.0, float(el.get('font_size', 13)) * 0.75))
+                            lbl = prefix_lbl
+                            clean_override = custom_override
+                            if clean_override and not show_label and custom_lbl and clean_override.startswith(custom_lbl):
+                                clean_override = clean_override[len(custom_lbl):].strip()
+                            val_text = f"{lbl}{name}" if clean_override is None else f"{lbl}{clean_override}"
+                            f_sz = max(8.0, min(13.0, float(el.get('font_size', 13)) * 0.75))
                             ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
-                            cmds.append(f"BT /F2 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)[:28]}) Tj ET")
+                            cmds.append(f"BT /F2 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)[:32]}) Tj ET")
 
                         elif el_key == 'role':
-                            lbl = (custom_lbl + ' ') if custom_lbl else ('Role: ' if el.get('show_label', False) else '')
-                            val_text = f"{lbl}{role}" if custom_override is None else f"{lbl}{custom_override}"
+                            lbl = prefix_lbl
+                            clean_override = custom_override
+                            if clean_override and not show_label and custom_lbl and clean_override.startswith(custom_lbl):
+                                clean_override = clean_override[len(custom_lbl):].strip()
+                            val_text = f"{lbl}{role}" if clean_override is None else f"{lbl}{clean_override}"
                             f_sz = max(7.0, min(9.5, float(el.get('font_size', 9.5)) * 0.72))
                             ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
-                            cmds.append(f"BT /F1 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)[:28]}) Tj ET")
+                            cmds.append(f"BT /F1 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)[:32]}) Tj ET")
 
                         elif el_key == 'base_price':
-                            lbl = (custom_lbl + ' ') if custom_lbl else ('Base Price: ' if el.get('show_label', True) else 'Base: ')
-                            val_text = f"{lbl}Rs. {int(price):,}" if custom_override is None else f"{lbl}{custom_override}"
+                            lbl = prefix_lbl
+                            clean_override = custom_override
+                            if clean_override and not show_label and custom_lbl and clean_override.startswith(custom_lbl):
+                                clean_override = clean_override[len(custom_lbl):].strip()
+                            val_text = f"{lbl}Rs. {int(price):,}" if clean_override is None else f"{lbl}{clean_override}"
                             pill_h = el_h - 1.5
                             pill_y = el_y_bottom + 0.75
                             if el.get('bg_opacity') != 0:
@@ -2066,20 +2115,23 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                         else:
                             # Standard detail field or custom box
                             val_raw = custom_override if custom_override is not None else ''
-                            default_lbl = custom_lbl if custom_lbl is not None else ''
                             if not val_raw and custom_override is None:
-                                if el_key == 'location': val_raw = loc; default_lbl = default_lbl or 'Loc: '
-                                elif el_key == 'batting': val_raw = bat; default_lbl = default_lbl or 'Bat: '
-                                elif el_key == 'bowling': val_raw = bowl; default_lbl = default_lbl or 'Bowl: '
-                                elif el_key == 'mobile': val_raw = mob; default_lbl = default_lbl or 'Mob: '
-                                elif el_key == 'age': val_raw = str(age); default_lbl = default_lbl or 'Age: '
-                                elif el_key == 'experience': val_raw = str(exp); default_lbl = default_lbl or 'Exp: '
-                                elif el_key == 'application_id': val_raw = str(app_id); default_lbl = default_lbl or 'ID: '
+                                if el_key == 'location': val_raw = loc
+                                elif el_key == 'batting': val_raw = bat
+                                elif el_key == 'bowling': val_raw = bowl
+                                elif el_key == 'mobile': val_raw = mob
+                                elif el_key == 'age': val_raw = str(age)
+                                elif el_key == 'experience': val_raw = str(exp)
+                                elif el_key == 'application_id': val_raw = str(app_id)
                                 else:
                                     val_raw = el.get('label') or el_key.replace('_', ' ').title()
 
-                            lbl = default_lbl if el.get('show_label', True) else ''
-                            val_text = f"{lbl}{val_raw}" if not val_raw.startswith(lbl) else val_raw
+                            # If show_label is False and val_raw contains custom_lbl as prefix, strip it
+                            if not show_label and custom_lbl and val_raw.startswith(custom_lbl):
+                                val_raw = val_raw[len(custom_lbl):].strip()
+
+                            lbl = prefix_lbl
+                            val_text = f"{lbl}{val_raw}" if (lbl and not val_raw.startswith(lbl)) else val_raw
                             ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
                             align = el.get('align', 'left')
                             tx = el_x
@@ -2087,7 +2139,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                                 tx = max(el_x, el_x + el_w - (len(val_text) * f_sz * 0.52))
                             elif align == 'center':
                                 tx = max(el_x, el_x + (el_w / 2.0) - (len(val_text) * f_sz * 0.26))
-                            cmds.append(f"BT {font_choice} {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {tx:.1f} {ty:.1f} Td ({esc(val_text)[:32]}) Tj ET")
+                            cmds.append(f"BT {font_choice} {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {tx:.1f} {ty:.1f} Td ({esc(val_text)[:36]}) Tj ET")
 
             return "\n".join(cmds)
 
@@ -2242,10 +2294,22 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             meta_style = ParagraphStyle('MetaStyle', fontName='Helvetica-Bold', fontSize=9, leading=13, textColor=colors.HexColor('#334155'))
             summary_style = ParagraphStyle('SummaryStyle', fontName='Helvetica', fontSize=8.5, leading=12, textColor=colors.HexColor('#0284C7'))
 
-            story = [
-                Paragraph(str(auction_name), head_style),
-                Spacer(1, 4*mm)
-            ]
+            design_obj = AuctionPageDesign.objects.filter(auction=auction).first() if auction else None
+            pdf_design = (design_obj.design_json or {}).get('pdf_design', {}) if design_obj else {}
+            teams_cfg = pdf_design.get('teams_designer', {})
+            t_header = teams_cfg.get('header', {})
+            t_footer = teams_cfg.get('footer', {})
+
+            doc_title = t_header.get('title') or str(auction_name)
+            doc_subtitle = t_header.get('subtitle') or "Franchise Teams Squad Breakdowns & Purse Allocations"
+            show_hdr = t_header.get('show', True)
+
+            story = []
+            if show_hdr:
+                story.append(Paragraph(str(doc_title), head_style))
+                sub_style = ParagraphStyle('TeamSubStyle', fontName='Helvetica', fontSize=10, leading=14, textColor=colors.HexColor('#64748B'))
+                story.append(Paragraph(str(doc_subtitle), sub_style))
+                story.append(Spacer(1, 4*mm))
 
             config, _ = AuctionTournamentConfig.objects.get_or_create(auction=auction) if auction else (None, None)
 
@@ -2424,6 +2488,11 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             response = HttpResponse(out.getvalue(), content_type='application/pdf')
             response['Content-Disposition'] = f'attachment; filename="{auction_name}_Category_Report.pdf"'
             return response
+        except ImportError:
+            return Response(
+                {'error': "PDF generation engine ('reportlab') is not installed on this server. Please run 'pip install reportlab' in the backend environment."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -2460,10 +2529,22 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             th_style = ParagraphStyle('OwnerTh', fontName='Helvetica-Bold', fontSize=9, leading=12, textColor=colors.HexColor('#0F172A'))
             body_style = ParagraphStyle('OwnerBody', fontName='Helvetica', fontSize=8.5, leading=11, textColor=colors.HexColor('#1E293B'))
 
-            story = [
-                Paragraph(f"{auction_name} — Franchise Owners & Team Profile Summary", head_style),
-                Spacer(1, 5*mm)
-            ]
+            design_obj = AuctionPageDesign.objects.filter(auction=auction).first() if auction else None
+            pdf_design = (design_obj.design_json or {}).get('pdf_design', {}) if design_obj else {}
+            owners_cfg = pdf_design.get('owners_designer', {})
+            o_header = owners_cfg.get('header', {})
+            o_footer = owners_cfg.get('footer', {})
+
+            doc_title = o_header.get('title') or f"{auction_name} — Franchise Owners & Team Profile Summary"
+            doc_subtitle = o_header.get('subtitle') or "Official Purse Allocations, Expenditures & Limits"
+            show_hdr = o_header.get('show', True)
+
+            story = []
+            if show_hdr:
+                story.append(Paragraph(str(doc_title), head_style))
+                sub_style = ParagraphStyle('OwnerSub', fontName='Helvetica', fontSize=10, leading=14, textColor=colors.HexColor('#64748B'))
+                story.append(Paragraph(str(doc_subtitle), sub_style))
+                story.append(Spacer(1, 5*mm))
 
             owners_data = [[
                 Paragraph('#', th_style),
@@ -2518,6 +2599,11 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             response = HttpResponse(out.getvalue(), content_type='application/pdf')
             response['Content-Disposition'] = f'attachment; filename="{auction_name}_Franchise_Owners.pdf"'
             return response
+        except ImportError:
+            return Response(
+                {'error': "PDF generation engine ('reportlab') is not installed on this server. Please run 'pip install reportlab' in the backend environment."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -2722,6 +2808,11 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             response = HttpResponse(out.getvalue(), content_type='application/pdf')
             response['Content-Disposition'] = f'attachment; filename="{auction_name}_Complete_Booklet.pdf"'
             return response
+        except ImportError:
+            return Response(
+                {'error': "PDF generation engine ('reportlab') is not installed on this server. Please run 'pip install reportlab' in the backend environment."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
