@@ -1698,15 +1698,72 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             elif raw_bytes is None and (s.startswith('http://') or s.startswith('https://')):
                 import urllib.request
                 import re
-                fetch_url = s
-                # Convert Google Drive links to direct high-res thumbnail endpoint
+
+                # Check if it is a Google Drive link
+                gdrive_id = None
                 if 'drive.google.com' in s or 'googleusercontent.com' in s:
-                    m = re.search(r'/file/d/([a-zA-Z0-9_-]+)', s) or re.search(r'[?&]id=([a-zA-Z0-9_-]+)', s) or re.search(r'/d/([a-zA-Z0-9_-]+)', s)
+                    m = (
+                        re.search(r'/file/d/([a-zA-Z0-9_-]+)', s) or
+                        re.search(r'[?&]id=([a-zA-Z0-9_-]+)', s) or
+                        re.search(r'/d/([a-zA-Z0-9_-]+)', s)
+                    )
                     if m:
-                        fetch_url = f"https://drive.google.com/thumbnail?id={m.group(1)}&sz=w1000"
-                req_obj = urllib.request.Request(fetch_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-                req = urllib.request.urlopen(req_obj, timeout=8)
-                raw_bytes = req.read()
+                        gdrive_id = m.group(1)
+
+                # Check local disk cache for this Google Drive file ID
+                if gdrive_id:
+                    cache_dir = os.path.join(settings.MEDIA_ROOT, 'cache', 'gdrive')
+                    os.makedirs(cache_dir, exist_ok=True)
+                    cache_file = os.path.join(cache_dir, f"{gdrive_id}.jpg")
+                    if os.path.exists(cache_file) and os.path.getsize(cache_file) > 500:
+                        try:
+                            with open(cache_file, 'rb') as f:
+                                raw_bytes = f.read()
+                        except Exception:
+                            raw_bytes = None
+
+                # If not cached, attempt fetching via prioritized Google endpoints
+                if raw_bytes is None and gdrive_id:
+                    endpoints = [
+                        f"https://drive.google.com/thumbnail?id={gdrive_id}&sz=w1200",
+                        f"https://lh3.googleusercontent.com/d/{gdrive_id}",
+                        f"https://drive.usercontent.google.com/download?id={gdrive_id}&export=download&authuser=0",
+                        f"https://drive.google.com/uc?export=download&id={gdrive_id}",
+                    ]
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+                    }
+                    for ep in endpoints:
+                        try:
+                            req_obj = urllib.request.Request(ep, headers=headers)
+                            with urllib.request.urlopen(req_obj, timeout=6) as resp:
+                                cand_bytes = resp.read()
+                                # Verify it is a valid image, NOT an HTML login / error page
+                                if cand_bytes and len(cand_bytes) > 500 and not cand_bytes.lstrip().startswith((b'<!DOCTYPE', b'<html', b'<HTML')):
+                                    raw_bytes = cand_bytes
+                                    # Cache valid image bytes onto local server disk for zero-latency reuse
+                                    try:
+                                        cache_dir = os.path.join(settings.MEDIA_ROOT, 'cache', 'gdrive')
+                                        os.makedirs(cache_dir, exist_ok=True)
+                                        with open(os.path.join(cache_dir, f"{gdrive_id}.jpg"), 'wb') as cf:
+                                            cf.write(cand_bytes)
+                                    except Exception:
+                                        pass
+                                    break
+                        except Exception:
+                            continue
+
+                # Standard HTTP fetch for other external URLs
+                if raw_bytes is None:
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                    }
+                    req_obj = urllib.request.Request(s, headers=headers)
+                    with urllib.request.urlopen(req_obj, timeout=8) as req:
+                        cand_bytes = req.read()
+                        if cand_bytes and not cand_bytes.lstrip().startswith((b'<!DOCTYPE', b'<html', b'<HTML')):
+                            raw_bytes = cand_bytes
 
             # 4. Absolute filesystem path
             elif raw_bytes is None and os.path.exists(s):
@@ -2912,6 +2969,70 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             )
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=True, methods=['post'], permission_classes=[permissions.AllowAny])
+    def sync_drive_photos(self, request, pk=None):
+        """
+        Download and persist all Google Drive player photos to local server disk (MEDIA_ROOT/player_photos/).
+        Updates each player's photo_url to the local /media/ path so that:
+        1. Web frontend loads images instantly from own domain without ORB blocks.
+        2. PDF exports read directly from disk in milliseconds with 100% guarantee.
+        """
+        auction = self._get_auction(pk)
+        if not auction:
+            return Response({'error': 'Auction not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        import os
+        from django.conf import settings
+
+        players = list(auction.players.all())
+        target_dir = os.path.join(settings.MEDIA_ROOT, 'player_photos')
+        os.makedirs(target_dir, exist_ok=True)
+
+        synced = 0
+        failed = 0
+        already_local = 0
+        failed_players = []
+
+        for p in players:
+            p_url = str(p.photo_url or '').strip()
+            if not p_url:
+                continue
+
+            # If already a local media file on this server
+            if p_url.startswith('/media/player_photos/') or p_url.startswith('media/player_photos/'):
+                rel = p_url.lstrip('/').replace('media/', '', 1)
+                if os.path.exists(os.path.join(settings.MEDIA_ROOT, rel)):
+                    already_local += 1
+                    continue
+
+            # Check if it's a Google Drive or external URL
+            if 'drive.google.com' in p_url or 'googleusercontent.com' in p_url or p_url.startswith('http'):
+                img_dict = self._process_image_to_jpeg_dict(p_url)
+                if img_dict and img_dict.get('bytes'):
+                    filename = f"player_{p.id}.jpg"
+                    file_path = os.path.join(target_dir, filename)
+                    with open(file_path, 'wb') as f:
+                        f.write(img_dict['bytes'])
+
+                    local_url = f"/media/player_photos/{filename}"
+                    p.photo_url = local_url
+                    p.save(update_fields=['photo_url'])
+                    synced += 1
+                else:
+                    failed += 1
+                    p_name = p.player.full_name if (p.player and getattr(p.player, 'full_name', None)) else f"Player #{p.serial_no}"
+                    failed_players.append(p_name)
+
+        return Response({
+            'success': True,
+            'message': f"Synced {synced} photos to server. {already_local} were already local. {failed} failed.",
+            'total': len(players),
+            'synced': synced,
+            'already_local': already_local,
+            'failed': failed,
+            'failed_players': failed_players[:15],
+        })
 
     def _generate_pure_teams_pdf(self, auction_name, teams, auction):
         width, height = 595.28, 841.89
