@@ -2970,7 +2970,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    @action(detail=True, methods=['post'], permission_classes=[permissions.AllowAny])
+    @action(detail=True, methods=['get', 'post'], url_path='sync_drive_photos', permission_classes=[permissions.AllowAny])
     def sync_drive_photos(self, request, pk=None):
         """
         Download and persist all Google Drive player photos to local server disk (MEDIA_ROOT/player_photos/).

@@ -30,6 +30,8 @@ router.register(r'sponsors', AuctionSponsorItemViewSet, basename='auction_sponso
 router.register(r'media', AuctionMediaItemViewSet, basename='auction_media')
 
 urlpatterns = [
+    # Direct Action Routes for guaranteed matching across all DRF configurations
+    path('console/<str:pk>/sync_drive_photos/', Phase2AuctionConsoleViewSet.as_view({'post': 'sync_drive_photos', 'get': 'sync_drive_photos'}), name='auction_console_sync_drive_photos'),
     path('', include(router.urls)),
     # Public Spectator & Registration Endpoints (No Auth)
     path('public/viewer/<str:token>/', PublicSpectatorStateView.as_view(), name='public_spectator_state'),
