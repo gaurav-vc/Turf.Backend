@@ -1678,11 +1678,24 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
             raw_bytes = None
             s = str(img_data_or_url).strip()
 
-            if s.startswith('data:'):
+            # 1. Local disk media files (resolve before network to avoid loopback failures)
+            if '/media/' in s:
+                rel_path = s.split('/media/', 1)[1].lstrip('/')
+                full_path = os.path.join(settings.MEDIA_ROOT, rel_path)
+                if os.path.exists(full_path):
+                    with open(full_path, 'rb') as f:
+                        raw_bytes = f.read()
+
+            # 2. Base64 Data URLs (e.g. uploaded logos, canvases, custom icons)
+            if raw_bytes is None and s.startswith('data:'):
                 if ',' in s:
                     _, b64_part = s.split(',', 1)
-                    raw_bytes = base64.b64decode(b64_part)
-            elif s.startswith('http://') or s.startswith('https://'):
+                    # Normalize spaces/newlines from URL encoding
+                    b64_clean = b64_part.replace(' ', '+').strip()
+                    raw_bytes = base64.b64decode(b64_clean)
+
+            # 3. Remote HTTP / HTTPS URLs (e.g. Google Drive, external CDNs)
+            elif raw_bytes is None and (s.startswith('http://') or s.startswith('https://')):
                 import urllib.request
                 import re
                 fetch_url = s
@@ -1694,13 +1707,9 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 req_obj = urllib.request.Request(fetch_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
                 req = urllib.request.urlopen(req_obj, timeout=8)
                 raw_bytes = req.read()
-            elif s.startswith('/media/') or s.startswith('media/'):
-                rel_path = s.lstrip('/').replace('media/', '', 1)
-                full_path = os.path.join(settings.MEDIA_ROOT, rel_path)
-                if os.path.exists(full_path):
-                    with open(full_path, 'rb') as f:
-                        raw_bytes = f.read()
-            elif os.path.exists(s):
+
+            # 4. Absolute filesystem path
+            elif raw_bytes is None and os.path.exists(s):
                 with open(s, 'rb') as f:
                     raw_bytes = f.read()
 
@@ -2033,8 +2042,36 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                         prefix_lbl = f"{label_name} " if (show_label and label_name) else ""
 
                         c_r, c_g, c_b = hex_to_rgb(el.get('colour', '#0f172a'))
-                        f_sz = max(6.0, min(14.0, float(el.get('font_size', 9.5)) * 0.72))
-                        font_choice = '/F2' if el.get('bold', False) else '/F1'
+
+                        def get_font_token(ff, is_bold=False, is_italic=False):
+                            s = str(ff or '').strip().lower()
+                            if 'times' in s:
+                                if is_bold and is_italic: return '/F8'
+                                if is_bold: return '/F6'
+                                if is_italic: return '/F7'
+                                return '/F5'
+                            elif 'courier' in s or 'mono' in s:
+                                if is_bold and is_italic: return '/F12'
+                                if is_bold: return '/F10'
+                                if is_italic: return '/F11'
+                                return '/F9'
+                            else:
+                                if is_bold and is_italic: return '/F4'
+                                if is_bold: return '/F2'
+                                if is_italic: return '/F3'
+                                return '/F1'
+
+                        def fit_font_size(raw_size, text, box_w):
+                            try:
+                                base = max(5.0, float(raw_size or 10.0) * 0.75)
+                            except (ValueError, TypeError):
+                                base = 8.5
+                            est_w = len(text) * base * 0.52
+                            avail_w = max(10.0, box_w - 4.0)
+                            if est_w > avail_w:
+                                scale = max(0.55, avail_w / est_w)
+                                return max(5.0, base * scale)
+                            return base
 
                         if el_key == 'player_photo':
                             p_user = getattr(p, 'player', None)
@@ -2068,18 +2105,20 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                         elif el_key == 'player_number':
                             lbl = prefix_lbl if show_label else '#'
                             val_text = f"{lbl}{serial}" if custom_override is None else f"{lbl}{custom_override}"
-                            f_sz = max(8.0, min(12.0, float(el.get('font_size', 13)) * 0.75))
+                            font_choice = get_font_token(el.get('font_family', 'Helvetica'), el.get('bold', True), el.get('italic', False))
+                            f_sz = fit_font_size(el.get('font_size', 13), val_text, el_w)
                             ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
-                            cmds.append(f"BT /F2 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)}) Tj ET")
+                            cmds.append(f"BT {font_choice} {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)}) Tj ET")
 
                         elif el_key == 'category':
                             lbl = prefix_lbl
                             val_text = f"[{lbl}{cat}]" if custom_override is None else f"[{lbl}{custom_override}]"
-                            f_sz = max(7.0, min(10.0, float(el.get('font_size', 10)) * 0.72))
+                            font_choice = get_font_token(el.get('font_family', 'Helvetica'), el.get('bold', True), el.get('italic', False))
+                            f_sz = fit_font_size(el.get('font_size', 10), val_text, el_w)
                             ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
                             text_len_est = len(val_text) * f_sz * 0.52
                             tx = max(el_x, el_x + el_w - text_len_est) if el.get('align') == 'right' else el_x
-                            cmds.append(f"BT /F2 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {tx:.1f} {ty:.1f} Td ({esc(val_text)}) Tj ET")
+                            cmds.append(f"BT {font_choice} {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {tx:.1f} {ty:.1f} Td ({esc(val_text)}) Tj ET")
 
                         elif el_key == 'name':
                             lbl = prefix_lbl
@@ -2087,9 +2126,10 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                             if clean_override and not show_label and custom_lbl and clean_override.startswith(custom_lbl):
                                 clean_override = clean_override[len(custom_lbl):].strip()
                             val_text = f"{lbl}{name}" if clean_override is None else f"{lbl}{clean_override}"
-                            f_sz = max(8.0, min(13.0, float(el.get('font_size', 13)) * 0.75))
+                            font_choice = get_font_token(el.get('font_family', 'Helvetica'), el.get('bold', True), el.get('italic', False))
+                            f_sz = fit_font_size(el.get('font_size', 14), val_text, el_w)
                             ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
-                            cmds.append(f"BT /F2 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)[:32]}) Tj ET")
+                            cmds.append(f"BT {font_choice} {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)}) Tj ET")
 
                         elif el_key == 'role':
                             lbl = prefix_lbl
@@ -2097,9 +2137,10 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                             if clean_override and not show_label and custom_lbl and clean_override.startswith(custom_lbl):
                                 clean_override = clean_override[len(custom_lbl):].strip()
                             val_text = f"{lbl}{role}" if clean_override is None else f"{lbl}{clean_override}"
-                            f_sz = max(7.0, min(9.5, float(el.get('font_size', 9.5)) * 0.72))
+                            font_choice = get_font_token(el.get('font_family', 'Helvetica'), el.get('bold', False), el.get('italic', False))
+                            f_sz = fit_font_size(el.get('font_size', 10), val_text, el_w)
                             ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
-                            cmds.append(f"BT /F1 {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)[:32]}) Tj ET")
+                            cmds.append(f"BT {font_choice} {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x:.1f} {ty:.1f} Td ({esc(val_text)}) Tj ET")
 
                         elif el_key == 'base_price':
                             lbl = prefix_lbl
@@ -2116,9 +2157,10 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                                     cmds.append(f"{b_r:.3f} {b_g:.3f} {b_b:.3f} rg 0.70 0.88 0.75 RG 0.5 w {el_x:.1f} {pill_y:.1f} {el_w:.1f} {pill_h:.1f} re B")
                                 else:
                                     cmds.append(f"0.92 0.98 0.94 rg 0.70 0.88 0.75 RG 0.5 w {el_x:.1f} {pill_y:.1f} {el_w:.1f} {pill_h:.1f} re B")
-                            f_sz = max(7.0, min(10.5, float(el.get('font_size', 10.5)) * 0.75))
+                            font_choice = get_font_token(el.get('font_family', 'Helvetica'), el.get('bold', True), el.get('italic', False))
+                            f_sz = fit_font_size(el.get('font_size', 11), val_text, el_w)
                             ty = pill_y + (pill_h / 2.0) - (f_sz * 0.35)
-                            cmds.append(f"BT /F2 {f_sz:.1f} Tf 0.086 0.639 0.290 rg {el_x + 3.0:.1f} {ty:.1f} Td ({esc(val_text)}) Tj ET")
+                            cmds.append(f"BT {font_choice} {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {el_x + 3.0:.1f} {ty:.1f} Td ({esc(val_text)}) Tj ET")
 
                         else:
                             # Standard detail field or custom box
@@ -2140,6 +2182,15 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
 
                             lbl = prefix_lbl
                             val_text = f"{lbl}{val_raw}" if (lbl and not val_raw.startswith(lbl)) else val_raw
+
+                            box_op = float(el.get('bg_opacity', 0))
+                            if box_op > 0:
+                                box_hex = el.get('bg_colour', '#ffffff')
+                                b_r, b_g, b_b = hex_to_rgb(box_hex)
+                                cmds.append(f"{b_r:.3f} {b_g:.3f} {b_b:.3f} rg 0.5 w {el_x:.1f} {el_y_bottom:.1f} {el_w:.1f} {el_h:.1f} re B")
+
+                            font_choice = get_font_token(el.get('font_family', 'Helvetica'), el.get('bold', False), el.get('italic', False))
+                            f_sz = fit_font_size(el.get('font_size', 9.5), val_text, el_w)
                             ty = el_y_bottom + (el_h / 2.0) - (f_sz * 0.35)
                             align = el.get('align', 'left')
                             tx = el_x
@@ -2147,7 +2198,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                                 tx = max(el_x, el_x + el_w - (len(val_text) * f_sz * 0.52))
                             elif align == 'center':
                                 tx = max(el_x, el_x + (el_w / 2.0) - (len(val_text) * f_sz * 0.26))
-                            cmds.append(f"BT {font_choice} {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {tx:.1f} {ty:.1f} Td ({esc(val_text)[:36]}) Tj ET")
+                            cmds.append(f"BT {font_choice} {f_sz:.1f} Tf {c_r:.3f} {c_g:.3f} {c_b:.3f} rg {tx:.1f} {ty:.1f} Td ({esc(val_text)}) Tj ET")
 
             return "\n".join(cmds)
 
@@ -2190,13 +2241,31 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
 
         objects = {}
         objects[1] = f"<< /Type /Catalog /Pages 2 0 R >>"
+
+        # Register standard Type 1 fonts for Helvetica, Times, and Courier families
         objects[3] = f"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
         objects[4] = f"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>"
+        objects[5] = f"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique >>"
+        objects[6] = f"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-BoldOblique >>"
+        objects[7] = f"<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>"
+        objects[8] = f"<< /Type /Font /Subtype /Type1 /BaseFont /Times-Bold >>"
+        objects[9] = f"<< /Type /Font /Subtype /Type1 /BaseFont /Times-Italic >>"
+        objects[10] = f"<< /Type /Font /Subtype /Type1 /BaseFont /Times-BoldItalic >>"
+        objects[11] = f"<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>"
+        objects[12] = f"<< /Type /Font /Subtype /Type1 /BaseFont /Courier-Bold >>"
+        objects[13] = f"<< /Type /Font /Subtype /Type1 /BaseFont /Courier-Oblique >>"
+        objects[14] = f"<< /Type /Font /Subtype /Type1 /BaseFont /Courier-BoldOblique >>"
+
+        font_res_str = (
+            "/F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R "
+            "/F5 7 0 R /F6 8 0 R /F7 9 0 R /F8 10 0 R "
+            "/F9 11 0 R /F10 12 0 R /F11 13 0 R /F12 14 0 R"
+        )
 
         # Register Image XObjects (/Filter /DCTDecode for JPEG)
         images_dict = images_dict or {}
         img_name_to_obj_id = {}
-        next_obj_id = 5
+        next_obj_id = 15
         for img_name, img_data in images_dict.items():
             img_obj_id = next_obj_id
             next_obj_id += 1
@@ -2232,7 +2301,7 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                 f"<< /Type /Page /Parent 2 0 R "
                 f"/MediaBox [0 0 {width:.2f} {height:.2f}] "
                 f"/Contents {cid} 0 R "
-                f"/Resources << /Font << /F1 3 0 R /F2 4 0 R >> {xobj_res} >> >>"
+                f"/Resources << /Font << {font_res_str} >> {xobj_res} >> >>"
             )
             objects[cid] = (
                 f"<< /Length {len(s_bytes)} >>\nstream\n".encode('latin1') + s_bytes + b"\nendstream"
@@ -2661,48 +2730,68 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
 
             story = []
 
-            # ---------------- PAGE 1: COVER PAGE ----------------
-            story.append(Spacer(1, 20*mm))
-            if config and config.tournament_logo:
-                try:
-                    logo_rel = config.tournament_logo.replace(settings.MEDIA_URL, '').lstrip('/')
-                    logo_full = os.path.join(settings.MEDIA_ROOT, logo_rel)
-                    if os.path.exists(logo_full):
-                        story.append(RLImage(logo_full, width=45*mm, height=45*mm))
-                        story.append(Spacer(1, 8*mm))
-                except Exception:
-                    pass
+            # Retrieve saved cover page designer configuration
+            design_obj = AuctionPageDesign.objects.filter(auction=auction).first() if auction else None
+            pdf_design = (design_obj.design_json or {}).get('pdf_design', {}) if design_obj else {}
+            cover_cfg = pdf_design.get('cover_page', {})
 
-            story.append(Paragraph(str(auction_name), cover_title_style))
+            cover_title = cover_cfg.get('title') or str(auction_name)
+            cover_sub = cover_cfg.get('subtitle') or "OFFICIAL TOURNAMENT AUCTION BOOKLET"
+            cover_logo_url = cover_cfg.get('logo_url') or (config.tournament_logo if config else None)
+            cover_date_venue = cover_cfg.get('date_venue') or ""
+            show_logo = cover_cfg.get('show_logo', True)
+            show_stats = cover_cfg.get('show_stats', True)
+
+            # ---------------- PAGE 1: COVER PAGE ----------------
+            story.append(Spacer(1, 15*mm))
+            if show_logo and cover_logo_url:
+                try:
+                    logo_dict = self._process_image_to_jpeg_dict(cover_logo_url)
+                    if logo_dict:
+                        logo_io = io.BytesIO(logo_dict['bytes'])
+                        story.append(RLImage(logo_io, width=45*mm, height=45*mm))
+                        story.append(Spacer(1, 6*mm))
+                except Exception as e:
+                    print(f"[Booklet Cover] Logo embed error: {e}")
+
+            story.append(Paragraph(str(cover_title), cover_title_style))
             story.append(Spacer(1, 4*mm))
-            story.append(Paragraph("OFFICIAL TOURNAMENT AUCTION BOOKLET", cover_sub_style))
-            story.append(Spacer(1, 10*mm))
+            story.append(Paragraph(str(cover_sub), cover_sub_style))
+            story.append(Spacer(1, 6*mm))
+
+            if cover_date_venue:
+                story.append(Paragraph(str(cover_date_venue), cover_body_style))
+                story.append(Spacer(1, 8*mm))
+            else:
+                story.append(Spacer(1, 4*mm))
 
             # Tournament High-Level Stats Box
-            stats_data = [
-                [
-                    Paragraph('<b>Franchise Teams</b>', th_style),
-                    Paragraph(str(len(teams)), cover_sub_style),
-                    Paragraph('<b>Registered Players</b>', th_style),
-                    Paragraph(str(len(players)), cover_sub_style)
-                ],
-                [
-                    Paragraph('<b>Base Team Purse</b>', th_style),
-                    Paragraph(f"₹{int(auction.base_budget):,}" if auction else "—", cover_sub_style),
-                    Paragraph('<b>Squad Limit</b>', th_style),
-                    Paragraph(f"{config.max_squad if config else 11} Players", cover_sub_style)
+            if show_stats:
+                stats_data = [
+                    [
+                        Paragraph('<b>Franchise Teams</b>', th_style),
+                        Paragraph(str(len(teams)), cover_sub_style),
+                        Paragraph('<b>Registered Players</b>', th_style),
+                        Paragraph(str(len(players)), cover_sub_style)
+                    ],
+                    [
+                        Paragraph('<b>Base Team Purse</b>', th_style),
+                        Paragraph(f"₹{int(auction.base_budget):,}" if auction else "—", cover_sub_style),
+                        Paragraph('<b>Squad Limit</b>', th_style),
+                        Paragraph(f"{config.max_squad if config else 11} Players", cover_sub_style)
+                    ]
                 ]
-            ]
-            stats_tbl = Table(stats_data, colWidths=[38*mm, 45*mm, 42*mm, 45*mm])
-            stats_tbl.setStyle(TableStyle([
-                ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#F8FAFC')),
-                ('GRID', (0,0), (-1,-1), 1, colors.HexColor('#E2E8F0')),
-                ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-                ('TOPPADDING', (0,0), (-1,-1), 8),
-                ('BOTTOMPADDING', (0,0), (-1,-1), 8),
-            ]))
-            story.append(stats_tbl)
-            story.append(Spacer(1, 15*mm))
+                stats_tbl = Table(stats_data, colWidths=[38*mm, 45*mm, 42*mm, 45*mm])
+                stats_tbl.setStyle(TableStyle([
+                    ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#F8FAFC')),
+                    ('GRID', (0,0), (-1,-1), 1, colors.HexColor('#E2E8F0')),
+                    ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+                    ('TOPPADDING', (0,0), (-1,-1), 8),
+                    ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+                ]))
+                story.append(stats_tbl)
+                story.append(Spacer(1, 15*mm))
+
             story.append(Paragraph("Generated by TurfArena Live Auction Engine", cover_body_style))
             story.append(PageBreak())
 
