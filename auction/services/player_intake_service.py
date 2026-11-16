@@ -119,6 +119,11 @@ class PlayerIntakeService:
                 bowling = get_val('bowling style', 'bowling', 'bowling_style', 'bowler') or "Right Arm Medium"
                 location = get_val('location', 'city', 'area', 'address', 'state') or ""
                 photo_url = get_val('photo url', 'photo', 'image', 'photo_url', 'picture', 'avatar') or ""
+                if photo_url and ('drive.google.com' in photo_url or 'googleusercontent.com' in photo_url):
+                    import re
+                    m = re.search(r'/file/d/([a-zA-Z0-9_-]+)', photo_url) or re.search(r'[?&]id=([a-zA-Z0-9_-]+)', photo_url) or re.search(r'/d/([a-zA-Z0-9_-]+)', photo_url)
+                    if m:
+                        photo_url = f"https://drive.google.com/thumbnail?id={m.group(1)}&sz=w1000"
                 base_raw = get_val('base price', 'base_price', 'price', 'base', 'purse', 'amount')
                 
                 try:

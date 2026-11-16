@@ -1684,7 +1684,15 @@ class Phase2AuctionConsoleViewSet(viewsets.ViewSet):
                     raw_bytes = base64.b64decode(b64_part)
             elif s.startswith('http://') or s.startswith('https://'):
                 import urllib.request
-                req = urllib.request.urlopen(s, timeout=6)
+                import re
+                fetch_url = s
+                # Convert Google Drive links to direct high-res thumbnail endpoint
+                if 'drive.google.com' in s or 'googleusercontent.com' in s:
+                    m = re.search(r'/file/d/([a-zA-Z0-9_-]+)', s) or re.search(r'[?&]id=([a-zA-Z0-9_-]+)', s) or re.search(r'/d/([a-zA-Z0-9_-]+)', s)
+                    if m:
+                        fetch_url = f"https://drive.google.com/thumbnail?id={m.group(1)}&sz=w1000"
+                req_obj = urllib.request.Request(fetch_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+                req = urllib.request.urlopen(req_obj, timeout=8)
                 raw_bytes = req.read()
             elif s.startswith('/media/') or s.startswith('media/'):
                 rel_path = s.lstrip('/').replace('media/', '', 1)
