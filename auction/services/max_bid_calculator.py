@@ -95,7 +95,7 @@ def remaining_base_cost(auction, team):
     cat_needs = []
 
     for c in auction.categories.all():
-        req = c.target_count or 0
+        req = c.target_count or c.min_players or 0
         bought = cat_counts.get(c.name.strip().lower(), 0)
         rem = max(0, req - bought)
         price = c.base_price or Decimal('0.00')
@@ -295,7 +295,7 @@ def team_required_attribute_cost(auction, team, current_player_id=None):
     cat_rem = {}
     for c in ordered_categories:
         c_name = c.name.strip().lower()
-        target = c.target_count or 0
+        target = c.target_count or c.min_players or 0
         bought = cat_counts.get(c_name, 0)
         cat_rem[c_name] = max(0, target - bought)
 
@@ -468,8 +468,27 @@ def team_financials(auction, team, current_player_id=None):
     # Steps 6, 7, 8, 9, 10: Future Mandatory Cost
     future_mandatory_cost = team_required_attribute_cost(auction, team, current_player_id)
 
-    # Step 11: Team Reserve (protected money)
+    # Step 10b: Minimum squad size mandatory reserve
+    # If tournament mandates a minimum squad size (e.g. 11 players),
+    # the team must retain enough purse to acquire the remaining minimum squad slots.
     config = getattr(auction, 'v24_config', None)
+    min_squad_req = 0
+    if config:
+        min_squad_req = getattr(config, 'min_players', 0) or getattr(config, 'max_squad', 0) or 0
+    if not min_squad_req and hasattr(auction, 'min_players_per_team'):
+        min_squad_req = getattr(auction, 'min_players_per_team', 0) or 0
+
+    if min_squad_req > 0:
+        needed_after_current = max(0, int(min_squad_req) - (bought_count + 1))
+        if needed_after_current > 0:
+            cats = list(auction.categories.all())
+            min_base = min((c.base_price for c in cats if c.base_price), default=Decimal('0.00')) if cats else Decimal('0.00')
+            if min_base <= Decimal('0.00'):
+                min_base = assumed_current_base(auction)
+            squad_min_reserve = Decimal(needed_after_current) * min_base
+            future_mandatory_cost = max(future_mandatory_cost, squad_min_reserve)
+
+    # Step 11: Team Reserve (protected money)
     team_reserve = Decimal('0.00')
     if hasattr(team, 'reserve_amount') and team.reserve_amount:
         team_reserve = Decimal(str(team.reserve_amount))
@@ -485,9 +504,11 @@ def team_financials(auction, team, current_player_id=None):
     cat_counts = team_category_counts(auction, team)
     pending_slots = 0
     for c in auction.categories.all():
-        req = c.target_count or 0
+        req = c.target_count or c.min_players or 0
         bought = cat_counts.get(c.name.strip().lower(), 0)
         pending_slots += max(0, req - bought)
+    if min_squad_req > 0:
+        pending_slots = max(pending_slots, max(0, int(min_squad_req) - bought_count))
 
     # Team display metadata
     t_name = team.team.name if team.team else 'Team'
@@ -506,6 +527,11 @@ def team_financials(auction, team, current_player_id=None):
         t_logo = cd.get('logo_url') or cd.get('logo') or ''
     if not t_logo and team.team and getattr(team.team, 'customization', None):
         t_logo = (team.team.customization or {}).get('logo_url') or ''
+
+    if t_logo:
+        drive_match = re.search(r'drive\.google\.com/file/d/([a-zA-Z0-9_-]+)', str(t_logo))
+        if drive_match:
+            t_logo = f"https://drive.google.com/thumbnail?id={drive_match.group(1)}&sz=w1000"
 
     t_color = cd.get('color') or cd.get('team_color') or (team.team.logo_color if team.team and getattr(team.team, 'logo_color', None) else None) or getattr(team, 'color', None) or '#3b82f6'
 
