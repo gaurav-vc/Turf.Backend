@@ -15,6 +15,21 @@ from .max_bid_calculator import (
 
 class LiveAuctionEngine:
     @staticmethod
+    def _normalize_photo(photo_url, player_user=None):
+        photo = str(photo_url or '').strip()
+        if not photo and player_user and getattr(player_user, 'photo', None):
+            try:
+                photo = player_user.photo.url
+            except Exception:
+                photo = ""
+        if photo and ('drive.google.com' in photo or 'googleusercontent.com' in photo):
+            import re
+            m = re.search(r'/file/d/([a-zA-Z0-9_-]+)', photo) or re.search(r'[?&]id=([a-zA-Z0-9_-]+)', photo) or re.search(r'/d/([a-zA-Z0-9_-]+)', photo)
+            if m:
+                return f"https://drive.google.com/thumbnail?id={m.group(1)}&sz=w1000"
+        return photo
+
+    @staticmethod
     def get_live_state(auction):
         """
         Returns complete real-time state for live auction console & spectator screens.
@@ -68,7 +83,7 @@ class LiveAuctionEngine:
                 'bowling_style': active_player.bowling_style or "Right Arm Medium",
                 'location': active_player.location or "",
                 'base_price': float(active_player.base_price or 0),
-                'photo_url': active_player.photo_url or "",
+                'photo_url': LiveAuctionEngine._normalize_photo(active_player.photo_url, active_player.player),
                 'status': active_player.status,
                 'custom_data': active_player.custom_data or {},
             }
@@ -94,7 +109,7 @@ class LiveAuctionEngine:
                 'bowling_style': first_p.bowling_style or "Right Arm Medium",
                 'location': first_p.location or "",
                 'base_price': float(first_p.base_price or 0),
-                'photo_url': first_p.photo_url or "",
+                'photo_url': LiveAuctionEngine._normalize_photo(first_p.photo_url, first_p.player),
                 'status': first_p.status,
                 'custom_data': first_p.custom_data or {},
             }
@@ -115,7 +130,7 @@ class LiveAuctionEngine:
                 'base_price': float(recent_p.base_price or 0),
                 'sold_price': float(recent_p.sold_price or 0),
                 'sold_to_name': recent_p.sold_to.team.name if recent_p.sold_to and recent_p.sold_to.team else "",
-                'photo_url': recent_p.photo_url or "",
+                'photo_url': LiveAuctionEngine._normalize_photo(recent_p.photo_url, recent_p.player),
                 'status': recent_p.status,
             }
 

@@ -1,0 +1,61 @@
+Task Topic,Description,Priority,Due Date,Project,Assigned To,Platform,Estimated Effort,Effort Unit,Is Urgent
+Fix player excel bulk upload,Made excel sheet upload read all rows and skip blank ones properly,Priority,13-11-2026,,,Web,2,hours,TRUE
+Add column name matching for excel import,"Auto match columns like mobile, phone, skills even if user typed different headers",Priority,13-11-2026,,,Web,2,hours,TRUE
+Support custom extra fields on import,Save extra player data like experience and application id from excel,Priority,13-11-2026,,,Web,2,hours,TRUE
+Fix player serial number sequence,"Make sure players get 1, 2, 3 lot numbers in correct order",Priority,13-11-2026,,,Web,1,hours,TRUE
+Check for duplicate players during upload,Stop duplicate entries when uploading the same player again,Priority,13-11-2026,,,Web,1,hours,TRUE
+Fix delete single player from roster,"Player delete button was failing, fixed the delete api route",Priority,13-11-2026,,,Web,1,hours,TRUE
+Add delete all players button,Added safe button to clear all players when testing from scratch,Priority,13-11-2026,,,Web,1,hours,TRUE
+Add delete all teams button,Reset all created teams and squads with one click,Priority,13-11-2026,,,Web,1,hours,TRUE
+Fix mobile number showing scientific notation,"Phone numbers with 10 digits in excel were showing as 9.87E+09, fixed to plain text",Priority,13-11-2026,,,Web,1,hours,TRUE
+Auto format player base price on intake,Clean up rupee signs and commas when importing player price,Priority,13-11-2026,,,Web,2,hours,TRUE
+Fix player category mismatch,Keep category spelling consistent between excel and dropdowns,Priority,13-11-2026,,,Web,2,hours,TRUE
+Add spectator public view page,Created token link so public can watch live auction on screens without login,Priority,13-11-2026,,,Web,2,hours,TRUE
+Fix live console auto refresh,Keep console state in sync when auctioneer moves to next player,Priority,13-11-2026,,,Web,2,hours,TRUE
+Calculate team purse balance live,Deduct player sold price instantly from team remaining purse,Priority,13-11-2026,,,Web,2,hours,TRUE
+Fix next bid button increment,Calculate next bid automatically according to slab rules,Priority,13-11-2026,,,Web,2,hours,TRUE
+Handle unsold players queue,Move unsold players to secondary round queue automatically,Priority,13-11-2026,,,Web,2,hours,TRUE
+Add public registration link,Allow players to register online via form link before auction,Priority,13-11-2026,,,Web,2,hours,TRUE
+Fix local vs live api url switching,Auto detect when running on live domain vs localhost,Priority,13-11-2026,,,Web,2,hours,TRUE
+Fix card text cutting off in PDF,"Long names were getting clipped in PDF, added auto font size scaling",Priority,14-11-2026,,,Web,2,hours,TRUE
+Add font family selection in studio,"Let user pick Roboto, Inter, Times, Courier for card texts",Priority,14-11-2026,,,Web,2,hours,TRUE
+Fix bold and italic toggle on card fields,Make text weight and styling changes show properly on card preview,Priority,14-11-2026,,,Web,2,hours,TRUE
+Add text alignment control,"Added left, center, right alignment options for player details",Priority,14-11-2026,,,Web,2,hours,TRUE
+Fix card background opacity slider,Allow transparent card box so background image shows through,Priority,14-11-2026,,,Web,2,hours,TRUE
+Sync accent color with top bar and borders,"When user picks brand color, update card border and top header line",Priority,14-11-2026,,,Web,2,hours,TRUE
+Add background image upload for cards sheet,Let user upload custom tournament banner or glowing ribbon graphic,Priority,14-11-2026,,,Web,2,hours,TRUE
+Add background watermark opacity slider,Adjust watermark intensity from light 10% to full 100%,Priority,14-11-2026,,,Web,2,hours,TRUE
+Add draggable logo on preview sheet,Let user drag and drop sponsor logo anywhere on the page,Priority,14-11-2026,,,Web,2,hours,TRUE
+Add logo resize slider,Added width slider to make uploaded logo bigger or smaller,Priority,14-11-2026,,,Web,2,hours,TRUE
+Add sheet header title editor,Custom text field to change sheet title and category label,Priority,14-11-2026,,,Web,2,hours,TRUE
+Add empty slot card placeholders,Show neat slot box when players do not fill all cards on page,Priority,14-11-2026,,,Web,2,hours,TRUE
+Fix A4 paper preview aspect ratio,Made preview box match exact A4 sheet proportions on screen,Priority,14-11-2026,,,Web,2,hours,TRUE
+Auto save card design before export,Save layout in database automatically whenever user hits download,Priority,14-11-2026,,,Web,2,hours,TRUE
+Add category wise player roster PDF,New button to download category list PDF with table format,Priority,14-11-2026,,,Web,2,hours,TRUE
+Add franchise owners summary PDF,Separate PDF download showing team owners and remaining purse,Priority,14-11-2026,,,Web,2,hours,TRUE
+Add team and squad breakdown PDF,PDF download showing all teams with their final player rosters,Priority,14-11-2026,,,Web,2,hours,TRUE
+Add complete tournament booklet export,"Combines cover page, owners summary and category pool in one PDF",Priority,14-11-2026,,,Web,2,hours,TRUE
+Add custom cover page for booklet,"Cover designer with tournament logo, title, venue and date",Priority,14-11-2026,,,Web,2,hours,TRUE
+Fix base price rupee formatting,"Show Indian comma style like Rs. 10,00,000 instead of 1000000",Priority,14-11-2026,,,Web,2,hours,TRUE
+Fix Google Drive photo links in roster,Auto convert drive share and form links to direct image thumbnails,Priority,16-11-2026,,,Web,2,hours,TRUE
+Fix blocked by ORB error in browser,"Chrome was blocking drive images showing html login page, fixed links",Priority,16-11-2026,,,Web,2,hours,TRUE
+Add drive file ID regex parser,Extract file id from any google drive link format reliably,Priority,16-11-2026,,,Web,2,hours,TRUE
+Add drive image fallback links,"Try thumbnail first, then cdn, then direct export if one fails",Priority,16-11-2026,,,Web,2,hours,TRUE
+Add server disk cache for drive photos,Save fetched drive images in media cache so they load in 0.001s,Priority,16-11-2026,,,Web,2,hours,TRUE
+Check image magic bytes,Verify downloaded file is real JPG/PNG not Google access denied html page,Priority,16-11-2026,,,Web,2,hours,TRUE
+Prioritize local media disk files,Read local player photos directly from disk to stop server timeout,Priority,16-11-2026,,,Web,2,hours,TRUE
+Handle base64 uploaded photos,Clean up base64 image strings so custom photos render cleanly,Priority,16-11-2026,,,Web,2,hours,TRUE
+Build Sync Drive Photos backend api,New endpoint to download and save all drive photos to server disk,Priority,16-11-2026,,,Web,2,hours,TRUE
+Add Sync Drive Photos button in studio,Added sync button in top bar with loading spinner and message,Priority,16-11-2026,,,Web,2,hours,TRUE
+Add Sync Drive Photos in roster manager,Added sync button in player setup page for quick one click sync,Priority,16-11-2026,,,Web,2,hours,TRUE
+Fix 404 error on sync drive photos url,Added explicit direct url route in urls.py so it never 404s,Priority,16-11-2026,,,Web,2,hours,TRUE
+Allow both GET and POST for sync api,Made endpoint accept both get and post for easy testing,Priority,16-11-2026,,,Web,2,hours,TRUE
+Build Exact Replica PDF export engine,Uses browser blink engine to print exact 1:1 vector PDF with 0% change,Priority,16-11-2026,,,Web,2,hours,TRUE
+Add Exact Replica PDF button in studio,Highlighted primary button in top bar for instant exact visual download,Priority,16-11-2026,,,Web,2,hours,TRUE
+Support multi-page cards grid export,"Auto paginate 10, 50, 100+ players across clean A4 pages by grid size",Priority,16-11-2026,,,Web,2,hours,TRUE
+Category mode page separation,Start each category on a clean fresh A4 page in multi-page download,Priority,16-11-2026,,,Web,2,hours,TRUE
+Catch uncategorized players in PDF,Make sure players with missing category are still included in PDF,Priority,16-11-2026,,,Web,2,hours,TRUE
+Wait for all photos before PDF print,Added preloader to ensure all player photos load before print popup,Priority,16-11-2026,,,Web,2,hours,TRUE
+Fix A4 page break overflow,Strict 297mm height with page break avoid to stop cards getting cut in half,Priority,16-11-2026,,,Web,2,hours,TRUE
+Remove extra blank page at end of PDF,Set last page break-after to auto to stop blank trailing page,Priority,16-11-2026,,,Web,2,hours,TRUE
+Preserve glowing ribbon and dark theme,Ensure dark background and glowing wave graphics export with full colors,Priority,16-11-2026,,,Web,2,hours,TRUE
