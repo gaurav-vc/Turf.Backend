@@ -73,6 +73,33 @@ class LiveAuctionEngine:
             
             if bids_history:
                 highest_bid = bids_history[0]
+            elif active_player.status == 'SOLD' and active_player.sold_to:
+                st = active_player.sold_to
+                t_name = st.team.name if st.team else "Team"
+                cd = getattr(st, 'custom_data', {}) or {}
+                s_name = cd.get('short_name') or (getattr(st.team, 'short_name', None) if st.team else None)
+                if not s_name:
+                    words = [w for w in re.split(r'[\s\-_]+', t_name) if w]
+                    s_name = "".join(w[0] for w in words)[:4].upper() if len(words) >= 2 else t_name[:3].upper()
+                t_logo = ""
+                if st.team and getattr(st.team, 'logo', None):
+                    try:
+                        t_logo = st.team.logo.url
+                    except Exception:
+                        t_logo = ""
+                if not t_logo and getattr(st, 'custom_data', None):
+                    t_logo = st.custom_data.get('logo_url', '') or st.custom_data.get('logo', '')
+                t_logo = LiveAuctionEngine._normalize_photo(t_logo)
+                highest_bid = {
+                    'id': f'sold_{active_player.id}',
+                    'amount': float(active_player.sold_price or active_player.base_price or 0),
+                    'team_id': str(st.id),
+                    'team_name': t_name,
+                    'short_name': s_name,
+                    'team_logo': t_logo,
+                    'bid_type': 'Hammer Sold',
+                    'created_at': active_player.updated_at.isoformat() if hasattr(active_player, 'updated_at') and active_player.updated_at else '',
+                }
 
             player_data = {
                 'id': str(active_player.id),
@@ -84,6 +111,9 @@ class LiveAuctionEngine:
                 'bowling_style': active_player.bowling_style or "Right Arm Medium",
                 'location': active_player.location or "",
                 'base_price': float(active_player.base_price or 0),
+                'sold_price': float(active_player.sold_price or 0) if active_player.sold_price is not None else None,
+                'sold_to_name': active_player.sold_to.team.name if active_player.sold_to and active_player.sold_to.team else "",
+                'sold_to_id': str(active_player.sold_to.id) if active_player.sold_to else None,
                 'photo_url': LiveAuctionEngine._normalize_photo(active_player.photo_url, active_player.player),
                 'status': active_player.status,
                 'custom_data': active_player.custom_data or {},
@@ -180,7 +210,7 @@ class LiveAuctionEngine:
                 'remaining_count': remaining_count,
                 'total_teams': len(teams_financials),
             },
-            'current_bid': highest_bid['amount'] if highest_bid else (player_data['base_price'] if player_data else 0),
+            'current_bid': highest_bid['amount'] if highest_bid else ((float(active_player.sold_price) if active_player and active_player.status == 'SOLD' and active_player.sold_price is not None else player_data['base_price']) if player_data else 0),
             'highest_bid': highest_bid,
             'bid_history': bids_history,
             'teams': teams_financials,
@@ -317,7 +347,8 @@ class LiveAuctionEngine:
                 amount=amount
             )
 
-            auction.active_player = None
+            # Keep active_player so the screen displays the sold player with the SOLD animation/stamp
+            auction.active_player = player
             auction.save()
 
         return True, player
@@ -445,10 +476,11 @@ class LiveAuctionEngine:
     def select_player_by_number(auction, serial_no):
         """
         Puts a specific player on block by serial_no.
+        Supports active auction lot players as well as viewing already SOLD or UNSOLD players.
         """
-        player = auction.players.filter(serial_no=serial_no, status__in=['AVAILABLE', 'PENDING', 'UNSOLD']).first()
+        player = auction.players.filter(serial_no=serial_no).first()
         if not player:
-            return False, f"Player with Serial No. {serial_no} is not available."
+            return False, f"Player with Serial No. {serial_no} not found."
 
         with transaction.atomic():
             if auction.active_player and auction.active_player.id != player.id:
@@ -456,8 +488,9 @@ class LiveAuctionEngine:
                     auction.active_player.status = 'AVAILABLE'
                     auction.active_player.save()
 
-            player.status = 'BIDDING'
-            player.save()
+            if player.status not in ['SOLD', 'UNSOLD']:
+                player.status = 'BIDDING'
+                player.save()
 
             auction.active_player = player
             if auction.status != 'ACTIVE':
@@ -468,7 +501,7 @@ class LiveAuctionEngine:
                 auction=auction,
                 lot_player=player,
                 event_type='PLAYER_SELECTED',
-                details={'method': 'MANUAL_SERIAL_NO', 'serial_no': serial_no}
+                details={'method': 'MANUAL_SERIAL_NO', 'serial_no': serial_no, 'status': player.status}
             )
 
         return True, player
@@ -477,10 +510,11 @@ class LiveAuctionEngine:
     def select_player_by_id(auction, player_id):
         """
         Puts a specific player on block by player ID.
+        Supports active auction lot players as well as viewing already SOLD or UNSOLD players.
         """
-        player = auction.players.filter(id=player_id, status__in=['AVAILABLE', 'PENDING', 'UNSOLD']).first()
+        player = auction.players.filter(id=player_id).first()
         if not player:
-            return False, "Player is not available for auction."
+            return False, "Player not found."
 
         with transaction.atomic():
             if auction.active_player and auction.active_player.id != player.id:
@@ -488,8 +522,9 @@ class LiveAuctionEngine:
                     auction.active_player.status = 'AVAILABLE'
                     auction.active_player.save()
 
-            player.status = 'BIDDING'
-            player.save()
+            if player.status not in ['SOLD', 'UNSOLD']:
+                player.status = 'BIDDING'
+                player.save()
 
             auction.active_player = player
             if auction.status != 'ACTIVE':
@@ -500,7 +535,7 @@ class LiveAuctionEngine:
                 auction=auction,
                 lot_player=player,
                 event_type='PLAYER_SELECTED',
-                details={'method': 'MANUAL_ID', 'player_id': str(player_id)}
+                details={'method': 'MANUAL_ID', 'player_id': str(player_id), 'status': player.status}
             )
 
         return True, player
